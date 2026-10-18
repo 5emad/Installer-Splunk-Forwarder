@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>استقرار Splunk Forwarder</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Vazirmatn:wght@400;600;700&family=JetBrains+Mono&display=swap">
+<style>
+:root{--bg:#f3f5f7;--panel:#fff;--ink:#17222b;--mute:#5d6b76;--line:#d8dfe5;--accent:#0b6e79;--accent-ink:#fff;
+--ok:#177a46;--bad:#b3261e;--warn:#9a6a00;--con:#101a21;--con-ink:#cfe3ea}
+@media(prefers-color-scheme:dark){:root{--bg:#0f161b;--panel:#172129;--ink:#e6edf1;--mute:#93a3ae;--line:#2a3944;
+--accent:#38b2bf;--accent-ink:#06191c;--ok:#4cc38a;--bad:#ff8a80;--warn:#e5b94a;--con:#0a1014}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.7 Vazirmatn,Inter,Tahoma,"Segoe UI",sans-serif}
+header{padding:14px 24px;background:var(--panel);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:24px;flex-wrap:wrap}
+h1{font-size:17px;margin:0;font-weight:700}
+nav{display:flex;gap:4px}
+nav button{background:none;border:0;border-bottom:3px solid transparent;padding:8px 18px;font:inherit;color:var(--mute);cursor:pointer;font-weight:600}
+nav button[aria-selected=true]{color:var(--accent);border-color:var(--accent)}
+main{max-width:1180px;margin:0 auto;padding:20px}
+section.tab{display:none}section.tab.on{display:block}
+.box{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:16px;margin-bottom:16px}
+h2{font-size:15px;margin:0 0 12px}h3{font-size:14px;margin:0 0 8px}
+.grp{font-size:13px;color:var(--mute);margin:22px 0 8px;font-weight:600}
+.row{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end}
+label{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mute);min-width:150px;flex:1}
+label.chk{flex-direction:row;align-items:center;gap:6px;flex:none;color:var(--ink);font-size:13px}
+input,select,textarea{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:6px 8px;width:100%}
+input[type=radio],input[type=checkbox]{width:auto}
+input,textarea,pre{direction:ltr;text-align:left}
+textarea{min-height:80px;font-family:"JetBrains Mono",Consolas,monospace;font-size:12px}
+button.b{font:inherit;font-weight:600;border:1px solid var(--accent);background:var(--accent);color:var(--accent-ink);border-radius:4px;padding:6px 16px;cursor:pointer}
+button.b.sec{background:none;color:var(--accent)}
+button.b.cancel{background:none;color:var(--bad);border-color:var(--bad)}
+button:disabled{opacity:.4;cursor:not-allowed}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.acts{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
+.acts .sp{flex:1}
+pre.con{background:var(--con);color:var(--con-ink);margin:12px 0 0;padding:10px;border-radius:4px;height:150px;overflow:auto;font:12px/1.55 "JetBrains Mono",Consolas,monospace;white-space:pre-wrap}
+pre.con:empty::before{content:"خروجی زنده اینجا نمایش داده می‌شود";color:#6c828d;font-family:Vazirmatn,sans-serif;direction:rtl;display:block}
+.OK{color:#5ee6a0}.FAIL{color:#ff8a80}.INFO{color:var(--con-ink)}
+.hint{font-size:12px;color:var(--mute);margin-top:6px}
+table{width:100%;border-collapse:collapse;font-size:12px;direction:ltr}
+th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top}
+td.m{white-space:pre-wrap;max-width:420px;word-break:break-word}
+.s1{color:var(--ok);font-weight:600}.s0{color:var(--bad);font-weight:600}
+dialog{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:6px}
+.scroll{overflow:auto;max-height:560px}
+</style>
+</head>
+<body>
+<header>
+  <h1>مدیریت استقرار Splunk Forwarder و لاگینگ</h1>
+  <nav role="tablist">
+    <button role="tab" data-t="windows" aria-selected="true">Windows</button>
+    <button role="tab" data-t="linux" aria-selected="false">Linux</button>
+    <button role="tab" data-t="cisco" aria-selected="false">Cisco Syslog</button>
+    <button role="tab" data-t="history" aria-selected="false">تاریخچه و گزارش</button>
+  </nav>
+</header>
+<main>
+  <section class="tab on" id="t-windows"></section>
+  <section class="tab" id="t-linux"></section>
+  <section class="tab" id="t-cisco"></section>
+  <section class="tab" id="t-history">
+    <div class="box">
+      <h2>فیلتر</h2>
+      <div class="row" id="hf">
+        <label>از تاریخ<input type="date" name="df"></label>
+        <label>تا تاریخ<input type="date" name="dt"></label>
+        <label>سیستم‌عامل<select name="os"><option value="">همه</option><option>windows</option><option>linux</option></select></label>
+        <label>سرویس<select name="service"><option value="">همه</option><option>network</option><option>uf</option><option>sysmon</option><option>auditpol</option><option>auditd</option><option>cisco</option><option>system</option></select></label>
+        <label>وضعیت<select name="status"><option value="">همه</option><option value="ok">موفق</option><option value="fail">ناموفق</option></select></label>
+        <label>جستجو<input name="q" placeholder="IP یا متن پیام"></label>
+      </div>
+      <div class="acts">
+        <button class="b" id="hload">اعمال فیلتر</button>
+        <span class="sp"></span>
+        <a class="b sec" id="hcsv" href="#" style="text-decoration:none">خروجی CSV</a>
+        <a class="b sec" id="hpdf" href="#" style="text-decoration:none">خروجی PDF</a>
+      </div>
+    </div>
+    <div class="box scroll"><table><thead><tr><th>Time</th><th>Target</th><th>OS</th><th>Service</th><th>Operation</th><th>Status</th><th>User</th><th>Message</th></tr></thead><tbody id="hbody"></tbody></table>
+    <p class="hint" id="hempty" hidden>رکوردی با این فیلتر پیدا نشد. ابتدا از تب‌های Windows یا Linux یک عملیات اجرا کنید.</p></div>
+  </section>
+</main>
+
+<script>
+const $=(s,r=document)=>r.querySelector(s), $$=(s,r=document)=>[...r.querySelectorAll(s)];
+// every API call carries the per-run token the server injected into this page
+const TOK=($('meta[name=ufd-token]')||{}).content||'', _fetch=window.fetch.bind(window);
+window.fetch=(u,o={})=>{const h=new Headers(o.headers||{});h.set('X-UFD-Token',TOK);return _fetch(u,{...o,headers:h,credentials:'same-origin'});};
+const SVC=(a)=>[{l:'Start',p:{op:'start'}},{l:'Stop',p:{op:'stop'}},{l:'Restart',p:{op:'restart'}},{l:'Status',p:{op:'status'}}].map(b=>({...b,a}));
+
+const TASKS={
+windows:[
+ {g:'اتصال',cards:[{t:'بررسی پینگ و پورت‌های مدیریتی (WinRM 5985/5986، SMB 445)',btn:[{l:'اجرای تست',a:'connectivity'}]}]},
+ {g:'Splunk Universal Forwarder',cards:[
+  {t:'بررسی نصب بودن',btn:[{l:'بررسی',a:'uf_check'}]},
+  {t:'نصب / استقرار UF',f:[{n:'main',k:'file',l:'فایل MSI',acc:'.msi'},{n:'share_path',l:'یا مسیر فایل اشتراکی (اختیاری)',ph:'\\\\server\\share\\splunkuf.msi'},{n:'receiver',l:'Receiving indexer',ph:'10.0.0.5:9997'},{n:'splunk_pass',k:'password',l:'رمز admin برای UF (خالی = تصادفی)'}],btn:[{l:'نصب',a:'uf_install'}]},
+  {t:'ارسال فایل‌های کانفیگ (etc\\system\\local)',f:[{n:'cfg',k:'file',multi:1,l:'inputs.conf, outputs.conf, ...'},{n:'restart',k:'check',l:'ریستارت سرویس بعد از ارسال'}],btn:[{l:'ارسال کانفیگ',a:'uf_cfg'}]},
+  {t:'استقرار Add-on / App در مسیر etc\\apps',f:[{n:'main',k:'file',multi:1,l:'فایل یا پکیج (zip / spl / tgz یا فایل ساده)'},{n:'extract',k:'check',on:1,l:'آرشیوها (zip / spl / tgz) در مسیر apps اکسترکت شوند'},{n:'restart',k:'check',l:'ریستارت سرویس بعد از استقرار'}],btn:[{l:'استقرار',a:'uf_apps'}]},
+  {t:'کنترل سرویس SplunkForwarder',btn:SVC('uf_service')}]},
+ {g:'Sysmon',cards:[
+  {t:'بررسی نصب بودن',btn:[{l:'بررسی',a:'sysmon_check'}]},
+  {t:'نصب یا به‌روزرسانی کانفیگ',f:[{n:'main',k:'file',l:'Sysmon.exe / Sysmon64.exe (برای نصب اولیه)'},{n:'cfg',k:'file',l:'کانفیگ XML',acc:'.xml'}],btn:[{l:'اجرا',a:'sysmon_deploy'}]},
+  {t:'کنترل سرویس Sysmon',btn:SVC('sysmon_service')}]},
+ {g:'Auditpol',cards:[
+  {t:'اعمال سیاست‌های لاگینگ',f:[{n:'commands',k:'area',l:'هر خط یک دستور auditpol',ph:'auditpol /set /subcategory:"Process Creation" /success:enable /failure:enable'}],btn:[{l:'اعمال',a:'audit_apply'}]},
+  {t:'گزارش وضعیت پالیسی‌ها',btn:[{l:'auditpol /get /category:*',a:'audit_report'}]}]}
+],
+linux:[
+ {g:'اتصال',cards:[{t:'بررسی پورت SSH، ورود و دسترسی sudo',btn:[{l:'اجرای تست',a:'connectivity'}]},
+  {t:'تشخیص نوع توزیع لینوکس (نام، نسخه، خانواده، پکیج‌منیجر، معماری، نوع پکیج مناسب UF)',btn:[{l:'تشخیص توزیع',a:'distro'}]}]},
+ {g:'Splunk Universal Forwarder',cards:[
+  {t:'بررسی نصب بودن',btn:[{l:'بررسی',a:'uf_check'}]},
+  {t:'نصب UF',f:[{n:'main',k:'file',l:'پکیج (.deb / .rpm / .tgz)',acc:'.deb,.rpm,.tgz,.gz'},{n:'splunk_pass',k:'password',l:'رمز admin برای UF (خالی = تصادفی)'}],btn:[{l:'نصب',a:'uf_install'}]},
+  {t:'ارسال فایل‌های کانفیگ (/opt/splunkforwarder/etc/system/local)',f:[{n:'cfg',k:'file',multi:1,l:'inputs.conf, outputs.conf, ...'},{n:'restart',k:'check',l:'ریستارت سرویس بعد از ارسال'}],btn:[{l:'ارسال کانفیگ',a:'uf_cfg'}]},
+  {t:'استقرار Add-on / App در مسیر /opt/splunkforwarder/etc/apps',f:[{n:'main',k:'file',multi:1,l:'فایل یا پکیج (zip / spl / tgz یا فایل ساده)'},{n:'extract',k:'check',on:1,l:'آرشیوها (zip / spl / tgz) در مسیر apps اکسترکت شوند'},{n:'restart',k:'check',l:'ریستارت سرویس بعد از استقرار'}],btn:[{l:'استقرار',a:'uf_apps'}]},
+  {t:'کنترل سرویس Splunk',btn:SVC('uf_service')}]},
+ {g:'Auditd',cards:[
+  {t:'بررسی نصب بودن',btn:[{l:'بررسی',a:'auditd_check'}]},
+  {t:'نصب و به‌روزرسانی رول‌ها',f:[{n:'install',k:'check',l:'در صورت نبودن، auditd نصب شود',on:1},{n:'kill_lock',k:'check',l:'اگر apt/yum قفل است، پراسس آن کشته شود (ممکن است یک آپدیت در حال اجرا را قطع کند)'},{n:'cfg',k:'file',l:'فایل audit.rules'}],hint:'رول‌های معیوب شناسایی، حذف و لاگ می‌شوند و بارگذاری تا موفقیت تکرار می‌شود.',btn:[{l:'اجرا',a:'auditd_deploy'}]},
+  {t:'کنترل سرویس auditd',btn:SVC('auditd_service')}]}
+],
+cisco:[{g:'پیکربندی Syslog سوییچ',cards:[{t:'Cisco Syslog Manager (IOS / IOS-XE)',tpl:1,
+  f:[{n:'conn',k:'select',l:'پروتکل اتصال به سوییچ',opts:[['ssh','SSH (22)'],['telnet','Telnet (23)']]},
+     {n:'syslog_ip',l:'IP سرور Logging (Splunk / Syslog)',ph:'10.0.0.50'},
+     {n:'syslog_proto',k:'select',l:'پروتکل Syslog',opts:[['udp','UDP'],['tcp','TCP']]},
+     {n:'syslog_port',l:'پورت Syslog',val:'514'},
+     {n:'level',k:'select',l:'سطح لاگ (trap)',val:'informational',opts:['emergencies','alerts','critical','errors','warnings','notifications','informational','debugging'].map(x=>[x,x])},
+     {n:'facility',k:'select',l:'Facility',opts:[['','پیش‌فرض'],...[0,1,2,3,4,5,6,7].map(i=>['local'+i,'local'+i])]},
+     {n:'source_if',l:'Source interface (نوع و شماره پورت)',ph:'Vlan10 / Loopback0 / GigabitEthernet1/0/1'},
+     {n:'origin_id',k:'check',l:'نام هاست در پیام‌ها (origin-id hostname)'},
+     {n:'userinfo',k:'check',l:'ثبت کاربر در لاگ (logging userinfo)'},
+     {n:'config_log',k:'check',on:1,l:'ثبت دستورات پیکربندی (archive / log config)'},
+     {n:'login_log',k:'check',l:'ثبت ورود موفق/ناموفق (login on-success/on-failure log)'},
+     {n:'aaa_cmd',k:'check',l:'AAA command accounting (نیازمند aaa new-model و گروه فعال)'},
+     {n:'aaa_group',l:'نام گروه AAA',val:'tacacs+'},
+     {n:'extra',k:'area',l:'دستورات اضافه (هر خط یک دستور)',ph:'logging buffered 64000'},
+     {n:'save',k:'check',on:1,l:'ذخیره پیکربندی (write memory)'}],
+  hint:'در «دستورات اضافه» فقط دستورات logging، service timestamps، archive/log config، login، ntp و clock (با کلمات کامل) مجازند. ابتدا «تست اتصال» و «پیش‌نمایش» را بزنید. پورت مدیریتی و نوع اتصال بالا، پورت/پروتکل Syslog پایین.',
+  btn:[{l:'تست اتصال',a:'connectivity'},{l:'پیش‌نمایش دستورات',a:'preview'},{l:'اعمال روی سوییچ',a:'apply',primary:1},{l:'بررسی نتیجه',a:'verify'}]}]}]};
+
+function targetsForm(os){
+  const w=os==='windows', ci=os==='cisco';
+  const auth=w?'<label>احراز هویت<select name="auth"><option value="ntlm">Workgroup / Domain (NTLM)</option><option value="kerberos">Domain (Kerberos)</option><option value="credssp">CredSSP</option><option value="basic">Basic</option></select></label>'
+    :ci?'<label>Enable secret (اختیاری)<input type="password" name="enable" autocomplete="new-password"></label>'
+    :'<label>احراز هویت<select name="auth"><option value="password">Password</option><option value="key">SSH Key</option></select></label>';
+  return `<form class="box" id="tg-${os}" onsubmit="return false"><h2>${ci?'سوییچ‌های هدف':'هاست‌های هدف'}</h2>
+  <div class="row" style="margin-bottom:10px">
+    <label>اعتبارنامه ذخیره‌شده (رمزنگاری‌شده)<select name="cred"><option value="">— ورود دستی —</option></select></label>
+    <button class="b sec" type="button" data-vault="unlock">باز کردن Vault</button>
+    <button class="b sec" type="button" data-vault="save">ذخیره اعتبارنامه فعلی</button>
+    <button class="b cancel" type="button" data-vault="del">حذف انتخاب‌شده</button>
+  </div>
+  <div class="row">
+    <label class="chk"><input type="radio" name="mode" value="single" checked> تکی</label>
+    <label class="chk"><input type="radio" name="mode" value="range"> رنج / CIDR</label>
+    <label class="chk"><input type="radio" name="mode" value="csv"> فایل CSV</label>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <label style="flex:2">IP / FQDN / رنج<input name="targets" placeholder="10.0.0.5 &nbsp;|&nbsp; 10.0.0.0/24 &nbsp;|&nbsp; 10.0.0.1-10.0.0.20"></label>
+    <label>فایل CSV<input type="file" name="csv_file" accept=".csv"></label>
+  </div>
+  <div class="row" style="margin-top:10px">
+    <label>پورت ${w?'(WinRM)':ci?'(مدیریتی SSH/Telnet)':'(SSH)'}<input name="port" value="${w?5985:22}"></label>
+    <label>نام کاربری<input name="username" autocomplete="off"></label>
+    <label>${w||ci?'رمز عبور':'رمز عبور / passphrase کلید'}<input type="password" name="password" autocomplete="new-password"></label>
+    ${auth}
+    ${w?'<label class="chk"><input type="checkbox" name="winrm_verify" value="1"> بررسی گواهی HTTPS (پورت 5986)</label>':''}
+    ${w||ci?'':'<label>رمز sudo (خالی = همان رمز ورود)<input type="password" name="sudo_pass" autocomplete="new-password"></label>'}
+  </div>
+  ${w||ci?'':'<div class="row" style="margin-top:10px"><label style="flex:1">کلید خصوصی SSH (فقط برای حالت Key)<textarea name="key" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></label></div>'}
+  <p class="hint">ستون‌های CSV: <code>ip,port,username,password${w?',auth_type':''}</code> — مقادیر خالی از فرم بالا پر می‌شوند. ${w?'کاربر دامین را به شکل DOMAIN\\user وارد کنید.':''} رمزها فقط رمزنگاری‌شده در Vault ذخیره می‌شوند و هرگز به مرورگر برنمی‌گردند.</p></form>`;
+}
+
+function field(f){
+  const a=f.acc?` accept="${f.acc}"`:'';
+  if(f.k==='file')return `<label>${f.l}<input type="file" data-f="${f.n}" data-k="file"${f.multi?' multiple':''}${a}></label>`;
+  if(f.k==='check')return `<label class="chk"><input type="checkbox" data-f="${f.n}" data-k="check"${f.on?' checked':''}> ${f.l}</label>`;
+  if(f.k==='select')return `<label>${f.l}<select data-f="${f.n}" data-k="text">${f.opts.map(([v,t])=>`<option value="${v}"${v===f.val?' selected':''}>${t}</option>`).join('')}</select></label>`;
+  if(f.k==='area')return `<label style="flex:1 1 100%">${f.l}<textarea data-f="${f.n}" data-k="text" placeholder='${f.ph||''}'></textarea></label>`;
+  return `<label>${f.l}<input type="${f.k||'text'}" data-f="${f.n}" data-k="text" placeholder="${f.ph||''}" value="${f.val||''}" autocomplete="off"></label>`;
+}
+
+function build(os){
+  const el=$('#t-'+os);
+  el.innerHTML=targetsForm(os)+TASKS[os].map(g=>`<div class="grp">${g.g}</div>`+g.cards.map((c,i)=>`
+   <div class="box card" data-os="${os}"><h3>${c.t}</h3>
+    ${c.f?`<div class="row">${c.f.map(field).join('')}</div>`:''}
+    ${c.tpl?TPLROW:''}
+    ${c.hint?`<p class="hint">${c.hint}</p>`:''}
+    <div class="acts">${c.btn.map((b,j)=>`<button class="b${c.btn.length>1&&!b.primary?' sec':''}" data-a="${b.a}" data-p='${JSON.stringify(b.p||{})}'>${b.l}</button>`).join('')}
+      <span class="sp"></span><button class="b cancel" data-cancel disabled>Cancel</button></div>
+    <pre class="con" aria-live="polite"></pre></div>`).join('')).join('');
+}
+const TPLROW=`<div class="row" style="margin-top:10px"><label>قالب‌های ذخیره‌شده<select id="tplsel"><option value="">—</option></select></label>
+  <button class="b sec" type="button" data-tpl="load">بارگذاری قالب</button><button class="b sec" type="button" data-tpl="save">ذخیره به‌عنوان قالب</button><button class="b cancel" type="button" data-tpl="del">حذف قالب</button></div>`;
+['windows','linux','cisco'].forEach(build);
+
+$$('nav button').forEach(b=>b.onclick=()=>{
+  $$('nav button').forEach(x=>x.setAttribute('aria-selected',x===b));
+  $$('section.tab').forEach(s=>s.classList.toggle('on',s.id==='t-'+b.dataset.t));
+  if(b.dataset.t==='history')loadHist();
+});
+
+document.addEventListener('click',async e=>{
+  const card=e.target.closest('.card'); if(!card)return;
+  if(e.target.matches('[data-cancel]')){
+    if(card.jid)await fetch(`/api/jobs/${card.jid}/cancel`,{method:'POST'});
+    return;
+  }
+  const btn=e.target.closest('button[data-a]'); if(!btn)return;
+  const os=card.dataset.os, con=$('pre',card);
+  if($('[name=cred]',$('#tg-'+os)).value && !(await unlockVault()))return;
+  const fd=new FormData($('#tg-'+os));
+  fd.append('os',os); fd.append('action',btn.dataset.a);
+  const params=JSON.parse(btn.dataset.p||'{}');
+  $$('[data-f]',card).forEach(i=>{
+    const n=i.dataset.f,k=i.dataset.k;
+    if(k==='file'){[...i.files].forEach(f=>fd.append(n,f));}
+    else if(k==='check')params[n]=i.checked;
+    else params[n]=i.value;
+  });
+  fd.append('params',JSON.stringify(params));
+  con.textContent='';
+  const r=await fetch('/api/run',{method:'POST',body:fd});
+  if(!r.ok){const j=await r.json().catch(()=>({detail:r.statusText}));line(con,{t:'',ip:'',lvl:'FAIL',msg:j.detail});return;}
+  const {job,hosts}=await r.json(); card.jid=job;
+  $$('button[data-a]',card).forEach(b=>b.disabled=true); $('[data-cancel]',card).disabled=false;
+  line(con,{t:'',ip:'',lvl:'INFO',msg:`شروع روی ${hosts} هاست`});
+  const es=new EventSource(`/api/jobs/${job}/stream`);
+  es.onmessage=m=>line(con,JSON.parse(m.data));
+  es.addEventListener('end',()=>{es.close();card.jid=null;
+    $$('button[data-a]',card).forEach(b=>b.disabled=false); $('[data-cancel]',card).disabled=true;});
+  es.onerror=()=>{es.close();$$('button[data-a]',card).forEach(b=>b.disabled=false);$('[data-cancel]',card).disabled=true;};
+});
+function line(con,o){
+  const s=document.createElement('div'); s.className=o.lvl;
+  s.textContent=`${o.t} ${o.ip?o.ip.padEnd(15):''} ${o.lvl!=='INFO'?o.lvl+' ':''}${o.msg}`;
+  con.appendChild(s); con.scrollTop=con.scrollHeight;
+}
+
+function hq(){return new URLSearchParams(new FormData($('#hf').closest('.box')?$('#hf'):null)).toString()}
+function hparams(){const p=new URLSearchParams();$$('#hf [name]').forEach(i=>i.value&&p.set(i.name,i.value));return p.toString()}
+async function loadHist(){
+  const qs=hparams(), rows=await (await fetch('/api/history?'+qs)).json();
+  $('#hcsv').href='/api/history.csv?'+qs; $('#hpdf').href='/api/history.pdf?'+qs;
+  $('#hempty').hidden=rows.length>0;
+  $('#hbody').innerHTML=rows.map(r=>`<tr><td>${r.ts}</td><td>${esc(r.ip)}</td><td>${r.os}</td><td>${r.service}</td><td>${esc(r.operation)}</td><td class="s${r.ok}">${r.ok?'OK':'FAIL'}</td><td>${esc(r.operator)}</td><td class="m">${esc(r.message)}</td></tr>`).join('');
+}
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+$('#hload').onclick=loadHist;
+
+const HJ={'Content-Type':'application/json'};
+const dlg=document.createElement('dialog');
+dlg.innerHTML='<form method="dialog" style="min-width:300px"><p id="dmsg"></p><input type="password" id="dpw" autocomplete="off"><div class="acts"><button class="b" value="ok">تأیید</button><button class="b sec" value="cancel">انصراف</button></div></form>';
+document.body.appendChild(dlg);
+function askPass(msg){return new Promise(res=>{$('#dmsg',dlg).textContent=msg;$('#dpw',dlg).value='';
+  dlg.onclose=()=>res(dlg.returnValue==='ok'?$('#dpw',dlg).value:null);dlg.showModal();$('#dpw',dlg).focus();});}
+async function refreshVault(){
+  const v=await (await fetch('/api/vault')).json();
+  if(v.unlocked)$$('select[name=cred]').forEach(s=>{const cur=s.value;
+    s.innerHTML='<option value="">— ورود دستی —</option>'+v.names.map(n=>`<option>${esc(n)}</option>`).join('');s.value=cur;});
+  return v;
+}
+async function unlockVault(){
+  const v=await refreshVault(); if(v.unlocked)return true;
+  const pw=await askPass(v.exists?'رمز اصلی Vault را وارد کنید':'اولین استفاده: یک رمز اصلی (حداقل ۸ کاراکتر) برای رمزنگاری اعتبارنامه‌ها انتخاب کنید');
+  if(!pw)return false;
+  const r=await fetch('/api/vault/unlock',{method:'POST',headers:HJ,body:JSON.stringify({password:pw})});
+  if(!r.ok){alert((await r.json()).detail);return false}
+  await refreshVault();return true;
+}
+document.addEventListener('click',async e=>{
+  const b=e.target.closest('[data-vault]'); if(!b)return;
+  const form=b.closest('form'), sel=$('[name=cred]',form), act=b.dataset.vault;
+  if(!await unlockVault())return;
+  if(act==='save'){
+    const name=prompt('نام این اعتبارنامه:'); if(!name)return;
+    const g=n=>($(`[name=${n}]`,form)||{}).value||'';
+    const r=await fetch('/api/vault',{method:'POST',headers:HJ,body:JSON.stringify({name,username:g('username'),password:g('password'),enable:g('enable'),key:g('key'),sudo_pass:g('sudo_pass')})});
+    if(!r.ok){alert((await r.json()).detail);return}
+    await refreshVault(); $$('select[name=cred]').forEach(s=>s.value===''&&s===sel&&(s.value=name));
+  }
+  if(act==='del'&&sel.value){await fetch('/api/vault/'+encodeURIComponent(sel.value),{method:'DELETE'});sel.value='';await refreshVault();}
+});
+async function refreshTpl(){
+  const t=await (await fetch('/api/templates')).json(), s=$('#tplsel'); window._tpl=t; if(!s)return;
+  s.innerHTML='<option value="">—</option>'+Object.keys(t).map(n=>`<option>${esc(n)}</option>`).join('');
+}
+document.addEventListener('click',async e=>{
+  const b=e.target.closest('[data-tpl]'); if(!b)return;
+  const card=b.closest('.card'), sel=$('#tplsel'), act=b.dataset.tpl;
+  if(act==='save'){
+    const name=prompt('نام قالب:'); if(!name)return;
+    const params={}; $$('[data-f]',card).forEach(i=>{if(i.dataset.k!=='file')params[i.dataset.f]=i.dataset.k==='check'?i.checked:i.value});
+    await fetch('/api/templates',{method:'POST',headers:HJ,body:JSON.stringify({name,params})});
+    await refreshTpl(); sel.value=name;
+  }
+  if(act==='load'&&sel.value){
+    const p=(window._tpl||{})[sel.value]||{};
+    $$('[data-f]',card).forEach(i=>{const v=p[i.dataset.f]; if(v===undefined)return; if(i.dataset.k==='check')i.checked=!!v; else i.value=v;});
+    $$('[data-f=conn]',card).forEach(i=>i.dispatchEvent(new Event('change',{bubbles:true})));
+  }
+  if(act==='del'&&sel.value){await fetch('/api/templates/'+encodeURIComponent(sel.value),{method:'DELETE'});await refreshTpl();}
+});
+document.addEventListener('change',e=>{
+  if(e.target.dataset&&e.target.dataset.f==='conn'){const p=$('#tg-cisco [name=port]'); if(p)p.value=e.target.value==='telnet'?23:22;}
+});
+refreshVault(); refreshTpl();
+
+</script>
+</body>
+</html>

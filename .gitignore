@@ -1,0 +1,19 @@
+# runtime data (internal IPs, encrypted credentials, SSH host keys) - never commit
+history.db
+vault.json
+vault.json.tmp
+known_hosts
+templates.json
+*.tmp
+
+# local backups
+_backup/
+
+# Python / PyInstaller
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.spec
