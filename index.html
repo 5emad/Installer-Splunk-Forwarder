@@ -1,316 +1,210 @@
-<!doctype html>
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>استقرار Splunk Forwarder</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Vazirmatn:wght@400;600;700&family=JetBrains+Mono&display=swap">
+<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Splunk UF Deployer</title>
+<link rel=icon href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232f6bff'/%3E%3Cpath d='M16 6l8 3v6c0 5-3.4 9-8 11-4.6-2-8-6-8-11V9z' fill='white'/%3E%3C/svg%3E">
 <style>
-:root{--bg:#f3f5f7;--panel:#fff;--ink:#17222b;--mute:#5d6b76;--line:#d8dfe5;--accent:#0b6e79;--accent-ink:#fff;
---ok:#177a46;--bad:#b3261e;--warn:#9a6a00;--con:#101a21;--con-ink:#cfe3ea}
-@media(prefers-color-scheme:dark){:root{--bg:#0f161b;--panel:#172129;--ink:#e6edf1;--mute:#93a3ae;--line:#2a3944;
---accent:#38b2bf;--accent-ink:#06191c;--ok:#4cc38a;--bad:#ff8a80;--warn:#e5b94a;--con:#0a1014}}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.7 Vazirmatn,Inter,Tahoma,"Segoe UI",sans-serif}
-header{padding:14px 24px;background:var(--panel);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:24px;flex-wrap:wrap}
-h1{font-size:17px;margin:0;font-weight:700}
-nav{display:flex;gap:4px}
-nav button{background:none;border:0;border-bottom:3px solid transparent;padding:8px 18px;font:inherit;color:var(--mute);cursor:pointer;font-weight:600}
-nav button[aria-selected=true]{color:var(--accent);border-color:var(--accent)}
-main{max-width:1180px;margin:0 auto;padding:20px}
-section.tab{display:none}section.tab.on{display:block}
-.box{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:16px;margin-bottom:16px}
-h2{font-size:15px;margin:0 0 12px}h3{font-size:14px;margin:0 0 8px}
-.grp{font-size:13px;color:var(--mute);margin:22px 0 8px;font-weight:600}
-.row{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end}
-label{display:flex;flex-direction:column;gap:3px;font-size:12px;color:var(--mute);min-width:150px;flex:1}
-label.chk{flex-direction:row;align-items:center;gap:6px;flex:none;color:var(--ink);font-size:13px}
-input,select,textarea{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:6px 8px;width:100%}
-input[type=radio],input[type=checkbox]{width:auto}
-input,textarea,pre{direction:ltr;text-align:left}
-textarea{min-height:80px;font-family:"JetBrains Mono",Consolas,monospace;font-size:12px}
-button.b{font:inherit;font-weight:600;border:1px solid var(--accent);background:var(--accent);color:var(--accent-ink);border-radius:4px;padding:6px 16px;cursor:pointer}
-button.b.sec{background:none;color:var(--accent)}
-button.b.cancel{background:none;color:var(--bad);border-color:var(--bad)}
-button:disabled{opacity:.4;cursor:not-allowed}
-:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.acts{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}
-.acts .sp{flex:1}
-pre.con{background:var(--con);color:var(--con-ink);margin:12px 0 0;padding:10px;border-radius:4px;height:150px;overflow:auto;font:12px/1.55 "JetBrains Mono",Consolas,monospace;white-space:pre-wrap}
-pre.con:empty::before{content:"خروجی زنده اینجا نمایش داده می‌شود";color:#6c828d;font-family:Vazirmatn,sans-serif;direction:rtl;display:block}
-.OK{color:#5ee6a0}.FAIL{color:#ff8a80}.INFO{color:var(--con-ink)}
-.hint{font-size:12px;color:var(--mute);margin-top:6px}
-table{width:100%;border-collapse:collapse;font-size:12px;direction:ltr}
-th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top}
-td.m{white-space:pre-wrap;max-width:420px;word-break:break-word}
-.s1{color:var(--ok);font-weight:600}.s0{color:var(--bad);font-weight:600}
-dialog{background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:6px}
-.scroll{overflow:auto;max-height:560px}
-</style>
-</head>
-<body>
-<header>
-  <h1>مدیریت استقرار Splunk Forwarder و لاگینگ</h1>
-  <nav role="tablist">
-    <button role="tab" data-t="windows" aria-selected="true">Windows</button>
-    <button role="tab" data-t="linux" aria-selected="false">Linux</button>
-    <button role="tab" data-t="cisco" aria-selected="false">Cisco Syslog</button>
-    <button role="tab" data-t="history" aria-selected="false">تاریخچه و گزارش</button>
-  </nav>
-</header>
-<main>
-  <section class="tab on" id="t-windows"></section>
-  <section class="tab" id="t-linux"></section>
-  <section class="tab" id="t-cisco"></section>
-  <section class="tab" id="t-history">
-    <div class="box">
-      <h2>فیلتر</h2>
-      <div class="row" id="hf">
-        <label>از تاریخ<input type="date" name="df"></label>
-        <label>تا تاریخ<input type="date" name="dt"></label>
-        <label>سیستم‌عامل<select name="os"><option value="">همه</option><option>windows</option><option>linux</option></select></label>
-        <label>سرویس<select name="service"><option value="">همه</option><option>network</option><option>uf</option><option>sysmon</option><option>auditpol</option><option>auditd</option><option>cisco</option><option>system</option></select></label>
-        <label>وضعیت<select name="status"><option value="">همه</option><option value="ok">موفق</option><option value="fail">ناموفق</option></select></label>
-        <label>جستجو<input name="q" placeholder="IP یا متن پیام"></label>
-      </div>
-      <div class="acts">
-        <button class="b" id="hload">اعمال فیلتر</button>
-        <span class="sp"></span>
-        <a class="b sec" id="hcsv" href="#" style="text-decoration:none">خروجی CSV</a>
-        <a class="b sec" id="hpdf" href="#" style="text-decoration:none">خروجی PDF</a>
-      </div>
-    </div>
-    <div class="box scroll"><table><thead><tr><th>Time</th><th>Target</th><th>OS</th><th>Service</th><th>Operation</th><th>Status</th><th>User</th><th>Message</th></tr></thead><tbody id="hbody"></tbody></table>
-    <p class="hint" id="hempty" hidden>رکوردی با این فیلتر پیدا نشد. ابتدا از تب‌های Windows یا Linux یک عملیات اجرا کنید.</p></div>
-  </section>
-</main>
-
-<script>
-const $=(s,r=document)=>r.querySelector(s), $$=(s,r=document)=>[...r.querySelectorAll(s)];
-// every API call carries the per-run token the server injected into this page
-const TOK=($('meta[name=ufd-token]')||{}).content||'', _fetch=window.fetch.bind(window);
-window.fetch=(u,o={})=>{const h=new Headers(o.headers||{});h.set('X-UFD-Token',TOK);return _fetch(u,{...o,headers:h,credentials:'same-origin'});};
-const SVC=(a)=>[{l:'Start',p:{op:'start'}},{l:'Stop',p:{op:'stop'}},{l:'Restart',p:{op:'restart'}},{l:'Status',p:{op:'status'}}].map(b=>({...b,a}));
-
-const TASKS={
-windows:[
- {g:'اتصال',cards:[{t:'بررسی پینگ و پورت‌های مدیریتی (WinRM 5985/5986، SMB 445)',btn:[{l:'اجرای تست',a:'connectivity'}]}]},
- {g:'Splunk Universal Forwarder',cards:[
-  {t:'بررسی نصب بودن',btn:[{l:'بررسی',a:'uf_check'}]},
-  {t:'نصب / استقرار UF',f:[{n:'main',k:'file',l:'فایل MSI',acc:'.msi'},{n:'share_path',l:'یا مسیر فایل اشتراکی (اختیاری)',ph:'\\\\server\\share\\splunkuf.msi'},{n:'receiver',l:'Receiving indexer',ph:'10.0.0.5:9997'},{n:'splunk_pass',k:'password',l:'رمز admin برای UF (خالی = تصادفی)'}],btn:[{l:'نصب',a:'uf_install'}]},
-  {t:'ارسال فایل‌های کانفیگ (etc\\system\\local)',f:[{n:'cfg',k:'file',multi:1,l:'inputs.conf, outputs.conf, ...'},{n:'restart',k:'check',l:'ریستارت سرویس بعد از ارسال'}],btn:[{l:'ارسال کانفیگ',a:'uf_cfg'}]},
-  {t:'استقرار Add-on / App در مسیر etc\\apps',f:[{n:'main',k:'file',multi:1,l:'فایل یا پکیج (zip / spl / tgz یا فایل ساده)'},{n:'extract',k:'check',on:1,l:'آرشیوها (zip / spl / tgz) در مسیر apps اکسترکت شوند'},{n:'restart',k:'check',l:'ریستارت سرویس بعد از استقرار'}],btn:[{l:'استقرار',a:'uf_apps'}]},
-  {t:'کنترل سرویس SplunkForwarder',btn:SVC('uf_service')}]},
- {g:'Sysmon',cards:[
-  {t:'بررسی نصب بودن',btn:[{l:'بررسی',a:'sysmon_check'}]},
-  {t:'نصب یا به‌روزرسانی کانفیگ',f:[{n:'main',k:'file',l:'Sysmon.exe / Sysmon64.exe (برای نصب اولیه)'},{n:'cfg',k:'file',l:'کانفیگ XML',acc:'.xml'}],btn:[{l:'اجرا',a:'sysmon_deploy'}]},
-  {t:'کنترل سرویس Sysmon',btn:SVC('sysmon_service')}]},
- {g:'Auditpol',cards:[
-  {t:'اعمال سیاست‌های لاگینگ',f:[{n:'commands',k:'area',l:'هر خط یک دستور auditpol',ph:'auditpol /set /subcategory:"Process Creation" /success:enable /failure:enable'}],btn:[{l:'اعمال',a:'audit_apply'}]},
-  {t:'گزارش وضعیت پالیسی‌ها',btn:[{l:'auditpol /get /category:*',a:'audit_report'}]}]}
-],
-linux:[
- {g:'اتصال',cards:[{t:'بررسی پورت SSH، ورود و دسترسی sudo',btn:[{l:'اجرای تست',a:'connectivity'}]},
-  {t:'تشخیص نوع توزیع لینوکس (نام، نسخه، خانواده، پکیج‌منیجر، معماری، نوع پکیج مناسب UF)',btn:[{l:'تشخیص توزیع',a:'distro'}]}]},
- {g:'Splunk Universal Forwarder',cards:[
-  {t:'بررسی نصب بودن',btn:[{l:'بررسی',a:'uf_check'}]},
-  {t:'نصب UF',f:[{n:'main',k:'file',l:'پکیج (.deb / .rpm / .tgz)',acc:'.deb,.rpm,.tgz,.gz'},{n:'splunk_pass',k:'password',l:'رمز admin برای UF (خالی = تصادفی)'}],btn:[{l:'نصب',a:'uf_install'}]},
-  {t:'ارسال فایل‌های کانفیگ (/opt/splunkforwarder/etc/system/local)',f:[{n:'cfg',k:'file',multi:1,l:'inputs.conf, outputs.conf, ...'},{n:'restart',k:'check',l:'ریستارت سرویس بعد از ارسال'}],btn:[{l:'ارسال کانفیگ',a:'uf_cfg'}]},
-  {t:'استقرار Add-on / App در مسیر /opt/splunkforwarder/etc/apps',f:[{n:'main',k:'file',multi:1,l:'فایل یا پکیج (zip / spl / tgz یا فایل ساده)'},{n:'extract',k:'check',on:1,l:'آرشیوها (zip / spl / tgz) در مسیر apps اکسترکت شوند'},{n:'restart',k:'check',l:'ریستارت سرویس بعد از استقرار'}],btn:[{l:'استقرار',a:'uf_apps'}]},
-  {t:'کنترل سرویس Splunk',btn:SVC('uf_service')}]},
- {g:'Auditd',cards:[
-  {t:'بررسی نصب بودن',btn:[{l:'بررسی',a:'auditd_check'}]},
-  {t:'نصب و به‌روزرسانی رول‌ها',f:[{n:'install',k:'check',l:'در صورت نبودن، auditd نصب شود',on:1},{n:'kill_lock',k:'check',l:'اگر apt/yum قفل است، پراسس آن کشته شود (ممکن است یک آپدیت در حال اجرا را قطع کند)'},{n:'cfg',k:'file',l:'فایل audit.rules'}],hint:'رول‌های معیوب شناسایی، حذف و لاگ می‌شوند و بارگذاری تا موفقیت تکرار می‌شود.',btn:[{l:'اجرا',a:'auditd_deploy'}]},
-  {t:'کنترل سرویس auditd',btn:SVC('auditd_service')}]}
-],
-cisco:[{g:'پیکربندی Syslog سوییچ',cards:[{t:'Cisco Syslog Manager (IOS / IOS-XE)',tpl:1,
-  f:[{n:'conn',k:'select',l:'پروتکل اتصال به سوییچ',opts:[['ssh','SSH (22)'],['telnet','Telnet (23)']]},
-     {n:'syslog_ip',l:'IP سرور Logging (Splunk / Syslog)',ph:'10.0.0.50'},
-     {n:'syslog_proto',k:'select',l:'پروتکل Syslog',opts:[['udp','UDP'],['tcp','TCP']]},
-     {n:'syslog_port',l:'پورت Syslog',val:'514'},
-     {n:'level',k:'select',l:'سطح لاگ (trap)',val:'informational',opts:['emergencies','alerts','critical','errors','warnings','notifications','informational','debugging'].map(x=>[x,x])},
-     {n:'facility',k:'select',l:'Facility',opts:[['','پیش‌فرض'],...[0,1,2,3,4,5,6,7].map(i=>['local'+i,'local'+i])]},
-     {n:'source_if',l:'Source interface (نوع و شماره پورت)',ph:'Vlan10 / Loopback0 / GigabitEthernet1/0/1'},
-     {n:'origin_id',k:'check',l:'نام هاست در پیام‌ها (origin-id hostname)'},
-     {n:'userinfo',k:'check',l:'ثبت کاربر در لاگ (logging userinfo)'},
-     {n:'config_log',k:'check',on:1,l:'ثبت دستورات پیکربندی (archive / log config)'},
-     {n:'login_log',k:'check',l:'ثبت ورود موفق/ناموفق (login on-success/on-failure log)'},
-     {n:'aaa_cmd',k:'check',l:'AAA command accounting (نیازمند aaa new-model و گروه فعال)'},
-     {n:'aaa_group',l:'نام گروه AAA',val:'tacacs+'},
-     {n:'extra',k:'area',l:'دستورات اضافه (هر خط یک دستور)',ph:'logging buffered 64000'},
-     {n:'save',k:'check',on:1,l:'ذخیره پیکربندی (write memory)'}],
-  hint:'در «دستورات اضافه» فقط دستورات logging، service timestamps، archive/log config، login، ntp و clock (با کلمات کامل) مجازند. ابتدا «تست اتصال» و «پیش‌نمایش» را بزنید. پورت مدیریتی و نوع اتصال بالا، پورت/پروتکل Syslog پایین.',
-  btn:[{l:'تست اتصال',a:'connectivity'},{l:'پیش‌نمایش دستورات',a:'preview'},{l:'اعمال روی سوییچ',a:'apply',primary:1},{l:'بررسی نتیجه',a:'verify'}]}]}]};
-
-function targetsForm(os){
-  const w=os==='windows', ci=os==='cisco';
-  const auth=w?'<label>احراز هویت<select name="auth"><option value="ntlm">Workgroup / Domain (NTLM)</option><option value="kerberos">Domain (Kerberos)</option><option value="credssp">CredSSP</option><option value="basic">Basic</option></select></label>'
-    :ci?'<label>Enable secret (اختیاری)<input type="password" name="enable" autocomplete="new-password"></label>'
-    :'<label>احراز هویت<select name="auth"><option value="password">Password</option><option value="key">SSH Key</option></select></label>';
-  return `<form class="box" id="tg-${os}" onsubmit="return false"><h2>${ci?'سوییچ‌های هدف':'هاست‌های هدف'}</h2>
-  <div class="row" style="margin-bottom:10px">
-    <label>اعتبارنامه ذخیره‌شده (رمزنگاری‌شده)<select name="cred"><option value="">— ورود دستی —</option></select></label>
-    <button class="b sec" type="button" data-vault="unlock">باز کردن Vault</button>
-    <button class="b sec" type="button" data-vault="save">ذخیره اعتبارنامه فعلی</button>
-    <button class="b cancel" type="button" data-vault="del">حذف انتخاب‌شده</button>
-  </div>
-  <div class="row">
-    <label class="chk"><input type="radio" name="mode" value="single" checked> تکی</label>
-    <label class="chk"><input type="radio" name="mode" value="range"> رنج / CIDR</label>
-    <label class="chk"><input type="radio" name="mode" value="csv"> فایل CSV</label>
-  </div>
-  <div class="row" style="margin-top:10px">
-    <label style="flex:2">IP / FQDN / رنج<input name="targets" placeholder="10.0.0.5 &nbsp;|&nbsp; 10.0.0.0/24 &nbsp;|&nbsp; 10.0.0.1-10.0.0.20"></label>
-    <label>فایل CSV<input type="file" name="csv_file" accept=".csv"></label>
-  </div>
-  <div class="row" style="margin-top:10px">
-    <label>پورت ${w?'(WinRM)':ci?'(مدیریتی SSH/Telnet)':'(SSH)'}<input name="port" value="${w?5985:22}"></label>
-    <label>نام کاربری<input name="username" autocomplete="off"></label>
-    <label>${w||ci?'رمز عبور':'رمز عبور / passphrase کلید'}<input type="password" name="password" autocomplete="new-password"></label>
-    ${auth}
-    ${w?'<label class="chk"><input type="checkbox" name="winrm_verify" value="1"> بررسی گواهی HTTPS (پورت 5986)</label>':''}
-    ${w||ci?'':'<label>رمز sudo (خالی = همان رمز ورود)<input type="password" name="sudo_pass" autocomplete="new-password"></label>'}
-  </div>
-  ${w||ci?'':'<div class="row" style="margin-top:10px"><label style="flex:1">کلید خصوصی SSH (فقط برای حالت Key)<textarea name="key" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></label></div>'}
-  <p class="hint">ستون‌های CSV: <code>ip,port,username,password${w?',auth_type':''}</code> — مقادیر خالی از فرم بالا پر می‌شوند. ${w?'کاربر دامین را به شکل DOMAIN\\user وارد کنید.':''} رمزها فقط رمزنگاری‌شده در Vault ذخیره می‌شوند و هرگز به مرورگر برنمی‌گردند.</p></form>`;
-}
-
-function field(f){
-  const a=f.acc?` accept="${f.acc}"`:'';
-  if(f.k==='file')return `<label>${f.l}<input type="file" data-f="${f.n}" data-k="file"${f.multi?' multiple':''}${a}></label>`;
-  if(f.k==='check')return `<label class="chk"><input type="checkbox" data-f="${f.n}" data-k="check"${f.on?' checked':''}> ${f.l}</label>`;
-  if(f.k==='select')return `<label>${f.l}<select data-f="${f.n}" data-k="text">${f.opts.map(([v,t])=>`<option value="${v}"${v===f.val?' selected':''}>${t}</option>`).join('')}</select></label>`;
-  if(f.k==='area')return `<label style="flex:1 1 100%">${f.l}<textarea data-f="${f.n}" data-k="text" placeholder='${f.ph||''}'></textarea></label>`;
-  return `<label>${f.l}<input type="${f.k||'text'}" data-f="${f.n}" data-k="text" placeholder="${f.ph||''}" value="${f.val||''}" autocomplete="off"></label>`;
-}
-
-function build(os){
-  const el=$('#t-'+os);
-  el.innerHTML=targetsForm(os)+TASKS[os].map(g=>`<div class="grp">${g.g}</div>`+g.cards.map((c,i)=>`
-   <div class="box card" data-os="${os}"><h3>${c.t}</h3>
-    ${c.f?`<div class="row">${c.f.map(field).join('')}</div>`:''}
-    ${c.tpl?TPLROW:''}
-    ${c.hint?`<p class="hint">${c.hint}</p>`:''}
-    <div class="acts">${c.btn.map((b,j)=>`<button class="b${c.btn.length>1&&!b.primary?' sec':''}" data-a="${b.a}" data-p='${JSON.stringify(b.p||{})}'>${b.l}</button>`).join('')}
-      <span class="sp"></span><button class="b cancel" data-cancel disabled>Cancel</button></div>
-    <pre class="con" aria-live="polite"></pre></div>`).join('')).join('');
-}
-const TPLROW=`<div class="row" style="margin-top:10px"><label>قالب‌های ذخیره‌شده<select id="tplsel"><option value="">—</option></select></label>
-  <button class="b sec" type="button" data-tpl="load">بارگذاری قالب</button><button class="b sec" type="button" data-tpl="save">ذخیره به‌عنوان قالب</button><button class="b cancel" type="button" data-tpl="del">حذف قالب</button></div>`;
-['windows','linux','cisco'].forEach(build);
-
-$$('nav button').forEach(b=>b.onclick=()=>{
-  $$('nav button').forEach(x=>x.setAttribute('aria-selected',x===b));
-  $$('section.tab').forEach(s=>s.classList.toggle('on',s.id==='t-'+b.dataset.t));
-  if(b.dataset.t==='history')loadHist();
-});
-
-document.addEventListener('click',async e=>{
-  const card=e.target.closest('.card'); if(!card)return;
-  if(e.target.matches('[data-cancel]')){
-    if(card.jid)await fetch(`/api/jobs/${card.jid}/cancel`,{method:'POST'});
-    return;
-  }
-  const btn=e.target.closest('button[data-a]'); if(!btn)return;
-  const os=card.dataset.os, con=$('pre',card);
-  if($('[name=cred]',$('#tg-'+os)).value && !(await unlockVault()))return;
-  const fd=new FormData($('#tg-'+os));
-  fd.append('os',os); fd.append('action',btn.dataset.a);
-  const params=JSON.parse(btn.dataset.p||'{}');
-  $$('[data-f]',card).forEach(i=>{
-    const n=i.dataset.f,k=i.dataset.k;
-    if(k==='file'){[...i.files].forEach(f=>fd.append(n,f));}
-    else if(k==='check')params[n]=i.checked;
-    else params[n]=i.value;
-  });
-  fd.append('params',JSON.stringify(params));
-  con.textContent='';
-  const r=await fetch('/api/run',{method:'POST',body:fd});
-  if(!r.ok){const j=await r.json().catch(()=>({detail:r.statusText}));line(con,{t:'',ip:'',lvl:'FAIL',msg:j.detail});return;}
-  const {job,hosts}=await r.json(); card.jid=job;
-  $$('button[data-a]',card).forEach(b=>b.disabled=true); $('[data-cancel]',card).disabled=false;
-  line(con,{t:'',ip:'',lvl:'INFO',msg:`شروع روی ${hosts} هاست`});
-  const es=new EventSource(`/api/jobs/${job}/stream`);
-  es.onmessage=m=>line(con,JSON.parse(m.data));
-  es.addEventListener('end',()=>{es.close();card.jid=null;
-    $$('button[data-a]',card).forEach(b=>b.disabled=false); $('[data-cancel]',card).disabled=true;});
-  es.onerror=()=>{es.close();$$('button[data-a]',card).forEach(b=>b.disabled=false);$('[data-cancel]',card).disabled=true;};
-});
-function line(con,o){
-  const s=document.createElement('div'); s.className=o.lvl;
-  s.textContent=`${o.t} ${o.ip?o.ip.padEnd(15):''} ${o.lvl!=='INFO'?o.lvl+' ':''}${o.msg}`;
-  con.appendChild(s); con.scrollTop=con.scrollHeight;
-}
-
-function hq(){return new URLSearchParams(new FormData($('#hf').closest('.box')?$('#hf'):null)).toString()}
-function hparams(){const p=new URLSearchParams();$$('#hf [name]').forEach(i=>i.value&&p.set(i.name,i.value));return p.toString()}
-async function loadHist(){
-  const qs=hparams(), rows=await (await fetch('/api/history?'+qs)).json();
-  $('#hcsv').href='/api/history.csv?'+qs; $('#hpdf').href='/api/history.pdf?'+qs;
-  $('#hempty').hidden=rows.length>0;
-  $('#hbody').innerHTML=rows.map(r=>`<tr><td>${r.ts}</td><td>${esc(r.ip)}</td><td>${r.os}</td><td>${r.service}</td><td>${esc(r.operation)}</td><td class="s${r.ok}">${r.ok?'OK':'FAIL'}</td><td>${esc(r.operator)}</td><td class="m">${esc(r.message)}</td></tr>`).join('');
-}
-const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-$('#hload').onclick=loadHist;
-
-const HJ={'Content-Type':'application/json'};
-const dlg=document.createElement('dialog');
-dlg.innerHTML='<form method="dialog" style="min-width:300px"><p id="dmsg"></p><input type="password" id="dpw" autocomplete="off"><div class="acts"><button class="b" value="ok">تأیید</button><button class="b sec" value="cancel">انصراف</button></div></form>';
-document.body.appendChild(dlg);
-function askPass(msg){return new Promise(res=>{$('#dmsg',dlg).textContent=msg;$('#dpw',dlg).value='';
-  dlg.onclose=()=>res(dlg.returnValue==='ok'?$('#dpw',dlg).value:null);dlg.showModal();$('#dpw',dlg).focus();});}
-async function refreshVault(){
-  const v=await (await fetch('/api/vault')).json();
-  if(v.unlocked)$$('select[name=cred]').forEach(s=>{const cur=s.value;
-    s.innerHTML='<option value="">— ورود دستی —</option>'+v.names.map(n=>`<option>${esc(n)}</option>`).join('');s.value=cur;});
-  return v;
-}
-async function unlockVault(){
-  const v=await refreshVault(); if(v.unlocked)return true;
-  const pw=await askPass(v.exists?'رمز اصلی Vault را وارد کنید':'اولین استفاده: یک رمز اصلی (حداقل ۸ کاراکتر) برای رمزنگاری اعتبارنامه‌ها انتخاب کنید');
-  if(!pw)return false;
-  const r=await fetch('/api/vault/unlock',{method:'POST',headers:HJ,body:JSON.stringify({password:pw})});
-  if(!r.ok){alert((await r.json()).detail);return false}
-  await refreshVault();return true;
-}
-document.addEventListener('click',async e=>{
-  const b=e.target.closest('[data-vault]'); if(!b)return;
-  const form=b.closest('form'), sel=$('[name=cred]',form), act=b.dataset.vault;
-  if(!await unlockVault())return;
-  if(act==='save'){
-    const name=prompt('نام این اعتبارنامه:'); if(!name)return;
-    const g=n=>($(`[name=${n}]`,form)||{}).value||'';
-    const r=await fetch('/api/vault',{method:'POST',headers:HJ,body:JSON.stringify({name,username:g('username'),password:g('password'),enable:g('enable'),key:g('key'),sudo_pass:g('sudo_pass')})});
-    if(!r.ok){alert((await r.json()).detail);return}
-    await refreshVault(); $$('select[name=cred]').forEach(s=>s.value===''&&s===sel&&(s.value=name));
-  }
-  if(act==='del'&&sel.value){await fetch('/api/vault/'+encodeURIComponent(sel.value),{method:'DELETE'});sel.value='';await refreshVault();}
-});
-async function refreshTpl(){
-  const t=await (await fetch('/api/templates')).json(), s=$('#tplsel'); window._tpl=t; if(!s)return;
-  s.innerHTML='<option value="">—</option>'+Object.keys(t).map(n=>`<option>${esc(n)}</option>`).join('');
-}
-document.addEventListener('click',async e=>{
-  const b=e.target.closest('[data-tpl]'); if(!b)return;
-  const card=b.closest('.card'), sel=$('#tplsel'), act=b.dataset.tpl;
-  if(act==='save'){
-    const name=prompt('نام قالب:'); if(!name)return;
-    const params={}; $$('[data-f]',card).forEach(i=>{if(i.dataset.k!=='file')params[i.dataset.f]=i.dataset.k==='check'?i.checked:i.value});
-    await fetch('/api/templates',{method:'POST',headers:HJ,body:JSON.stringify({name,params})});
-    await refreshTpl(); sel.value=name;
-  }
-  if(act==='load'&&sel.value){
-    const p=(window._tpl||{})[sel.value]||{};
-    $$('[data-f]',card).forEach(i=>{const v=p[i.dataset.f]; if(v===undefined)return; if(i.dataset.k==='check')i.checked=!!v; else i.value=v;});
-    $$('[data-f=conn]',card).forEach(i=>i.dispatchEvent(new Event('change',{bubbles:true})));
-  }
-  if(act==='del'&&sel.value){await fetch('/api/templates/'+encodeURIComponent(sel.value),{method:'DELETE'});await refreshTpl();}
-});
-document.addEventListener('change',e=>{
-  if(e.target.dataset&&e.target.dataset.f==='conn'){const p=$('#tg-cisco [name=port]'); if(p)p.value=e.target.value==='telnet'?23:22;}
-});
-refreshVault(); refreshTpl();
-
-</script>
-</body>
-</html>
+:root{--bg:#f3f5fa;--card:#fff;--tx:#172033;--mut:#667089;--bd:#e1e6ef;--in:#f7f9fc;--pri:#2f6bff;--pri2:#1d4fd8;--pril:#e8efff;--ok:#16a34a;--okl:#e7f6ec;--err:#dc2626;--errl:#fdecec;--wr:#d97706;--wrl:#fdf3e2;--code:#0d1424;--codetx:#cfd8e8;--sh:0 1px 2px #1720330d,0 4px 16px #1720330a;--hd:linear-gradient(120deg,#0e1730,#16285a 60%,#1d3a8a)}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0a0f1c;--card:#121a2c;--tx:#e6eaf4;--mut:#8b96b3;--bd:#232d47;--in:#0d1424;--pril:#1a2a55;--okl:#0f2a1b;--errl:#2e1316;--wrl:#2c2010;--code:#070b14;--sh:0 1px 2px #0006}}
+:root[data-theme=dark]{--bg:#0a0f1c;--card:#121a2c;--tx:#e6eaf4;--mut:#8b96b3;--bd:#232d47;--in:#0d1424;--pril:#1a2a55;--okl:#0f2a1b;--errl:#2e1316;--wrl:#2c2010;--code:#070b14;--sh:0 1px 2px #0006}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14.5px/1.5 "Segoe UI",system-ui,-apple-system,sans-serif}
+svg.i{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;vertical-align:-3px;flex:none}
+header{background:var(--hd);color:#fff;padding:12px 24px;display:flex;align-items:center;gap:14px;position:sticky;top:0;z-index:5;box-shadow:0 2px 12px #0003;flex-wrap:wrap}
+.logo{width:36px;height:36px;border-radius:10px;background:#ffffff1f;display:grid;place-items:center}.logo svg{width:22px;height:22px}
+.brand b{display:block;font-size:16px;letter-spacing:.2px}.brand span{font-size:12px;opacity:.65}
+.nav{margin-left:auto;display:flex;gap:4px;background:#ffffff14;padding:4px;border-radius:10px}.nav button{background:transparent;color:#ffffffc0;padding:6px 14px;font-weight:600}.nav button.on{background:#fff;color:#16285a}
+.thm{background:#ffffff14!important;color:#fff!important;padding:7px 10px!important}
+main{max-width:1500px;margin:18px auto;padding:0 20px 40px;display:grid;gap:16px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:16px 18px;box-shadow:var(--sh);min-width:0}
+.g2{display:grid;grid-template-columns:1.15fr 1fr 1fr;gap:16px}@media(max-width:1150px){.g2{grid-template-columns:1fr}}
+.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}@media(max-width:700px){.g3{grid-template-columns:1fr!important}}
+h3{margin:0 0 12px;font-size:13.5px;font-weight:700;display:flex;align-items:center;gap:8px;color:var(--tx)}
+h3 .n{width:22px;height:22px;border-radius:7px;background:var(--pril);color:var(--pri);display:grid;place-items:center;font-size:12px}
+h3 .x{margin-left:auto;font-weight:500;font-size:12px;color:var(--mut)}
+label{display:block;font-size:12px;font-weight:600;color:var(--mut);margin:0 0 4px}
+input,select,textarea{width:100%;padding:8px 11px;border:1px solid var(--bd);border-radius:8px;background:var(--in);color:var(--tx);font:inherit;transition:border-color .15s,box-shadow .15s}
+textarea{font:13px/1.55 Consolas,"Cascadia Mono",monospace;resize:vertical}
+input:focus,select:focus,textarea:focus{outline:0;border-color:var(--pri);box-shadow:0 0 0 3px #2f6bff2e}
+input[type=checkbox]{width:auto;accent-color:var(--pri)}input[type=file]{padding:6px;font-size:12.5px}
+button{cursor:pointer;border:0;border-radius:8px;padding:8px 16px;font:inherit;font-weight:600;background:var(--pri);color:#fff;display:inline-flex;align-items:center;gap:6px;justify-content:center;transition:background .15s,filter .15s,transform .05s;white-space:nowrap}
+button:hover{background:var(--pri2)}button:active{transform:translateY(1px)}button:disabled{opacity:.45;cursor:default;transform:none}
+.sec{background:var(--card);color:var(--tx);border:1px solid var(--bd)}.sec:hover{background:var(--in);border-color:var(--pri)}
+.cancel{background:var(--err)}.cancel:hover{background:#b91c1c}.big{padding:10px 22px;font-size:15px}
+.bar{display:flex;gap:12px;align-items:end;flex-wrap:wrap}.bar>div{min-width:140px}
+.seg{display:flex;background:var(--in);border:1px solid var(--bd);border-radius:10px;padding:3px;gap:2px}.seg button{background:transparent;color:var(--mut);padding:6px 14px;border-radius:7px}
+.seg button:hover{color:var(--tx);background:var(--card)}.seg .on,.seg .on:hover{background:var(--pri);color:#fff;box-shadow:0 1px 4px #2f6bff55}
+details summary{cursor:pointer;color:var(--pri);font-size:13px;font-weight:600;margin:12px 0 8px;user-select:none}.hint{color:var(--mut);font-size:12.5px}
+.drop{border:2px dashed var(--bd);border-radius:12px;padding:16px;text-align:center;cursor:pointer;color:var(--mut);transition:.15s;background:var(--in)}
+.drop:hover,.drop.ov{border-color:var(--pri);color:var(--pri);background:var(--pril)}.drop svg{width:26px;height:26px;display:block;margin:0 auto 4px}
+.fl{max-height:228px;overflow:auto;margin-top:10px}.fi{display:flex;gap:8px;align-items:center;padding:6px 4px;border-bottom:1px solid var(--bd);font-size:13px}.fi:last-child{border:0}
+.fi .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ext{font:700 10px/1 Consolas,monospace;padding:4px 5px;border-radius:5px;background:var(--pril);color:var(--pri);min-width:38px;text-align:center;text-transform:uppercase}
+.del{background:transparent;color:var(--mut);padding:2px 6px}.del:hover{background:var(--errl);color:var(--err)}
+.chips{display:flex;gap:8px;margin-bottom:12px;align-items:center;flex-wrap:wrap}
+.chip{padding:4px 12px;border-radius:20px;font-size:12px;font-weight:700;border:1px solid transparent;cursor:pointer;background:var(--in);color:var(--mut)}
+.chip.ok{background:var(--okl);color:var(--ok)}.chip.bad{background:var(--errl);color:var(--err)}.chip.run{background:var(--wrl);color:var(--wr)}.chip.sel{border-color:currentColor}
+.pbw{display:flex;align-items:center;gap:10px;margin-bottom:12px}.pb{flex:1;height:8px;background:var(--in);border:1px solid var(--bd);border-radius:8px;overflow:hidden}
+.pb i{display:block;height:100%;background:linear-gradient(90deg,var(--pri),#5b8cff);width:0;transition:width .4s}.pbw span{font-size:12px;color:var(--mut);min-width:60px;text-align:right}
+.r{border:1px solid var(--bd);border-left:4px solid var(--ok);border-radius:10px;margin-bottom:8px;overflow:hidden;background:var(--card)}.r.bad{border-left-color:var(--err)}.r.run{border-left-color:var(--wr)}
+.r summary{padding:9px 12px;cursor:pointer;display:flex;gap:10px;align-items:center;color:var(--tx);margin:0;font-size:13.5px;font-weight:400}
+.r summary b{font-family:Consolas,monospace;font-weight:700}.r summary span{flex:1;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;color:var(--mut)}
+.r pre{margin:0;padding:12px 14px;background:var(--code);color:var(--codetx);font:13px/1.55 Consolas,"Cascadia Mono",monospace;white-space:pre-wrap;max-height:420px;overflow:auto;overflow-wrap:anywhere}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--ok);flex:none}.bad .dot{background:var(--err)}.run .dot{background:var(--wr);animation:p 1s infinite}@keyframes p{50%{opacity:.25}}
+.empty{text-align:center;padding:28px 10px;color:var(--mut)}.empty svg{width:34px;height:34px;opacity:.5;display:block;margin:0 auto 6px}
+.tw{overflow:auto;max-height:70vh;border:1px solid var(--bd);border-radius:10px}table{border-collapse:collapse;width:100%}
+th{position:sticky;top:0;background:var(--in);color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.04em;z-index:1}
+td,th{border-bottom:1px solid var(--bd);padding:8px 10px;text-align:left;font-size:13.5px;vertical-align:top}tbody tr:hover{background:var(--in)}
+td pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:6px 0 0;font:12.5px Consolas,monospace;background:var(--code);color:var(--codetx);padding:8px;border-radius:6px;max-height:300px;overflow:auto}
+.pill{padding:2px 10px;border-radius:20px;font-size:12px;font-weight:700}.pill.ok{background:var(--okl);color:var(--ok)}.pill.fail{background:var(--errl);color:var(--err)}
+.f{display:flex;gap:4px}.f select{min-width:170px}.f button{padding:6px 10px}
+.err{color:var(--err);background:var(--errl);border-radius:10px;padding:10px 14px;font-weight:600}.err:empty{display:none}
+.hid{display:none!important}
+#toast{position:fixed;bottom:20px;right:20px;display:grid;gap:8px;z-index:20}
+#toast div{background:var(--tx);color:var(--bg);padding:10px 16px;border-radius:10px;box-shadow:0 6px 24px #0004;font-weight:600;font-size:13.5px;animation:tin .2s}
+#toast div.e{background:var(--err);color:#fff}#toast div.o{background:var(--ok);color:#fff}@keyframes tin{from{opacity:0;transform:translateY(8px)}}
+kbd{font:11px Consolas,monospace;border:1px solid #ffffff60;border-radius:4px;padding:0 4px;opacity:.75}
+@media(max-width:700px){header{padding:10px 16px}main{padding:0 16px 30px}.nav{margin-left:0;width:100%}.nav button{flex:1}}
+</style></head><body>
+<svg style="display:none"><symbol id=ic-play viewBox="0 0 24 24"><path d="M6 4l14 8-14 8z"/></symbol><symbol id=ic-stop viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+<symbol id=ic-up viewBox="0 0 24 24"><path d="M12 16V4M6 10l6-6 6 6M4 20h16"/></symbol><symbol id=ic-down viewBox="0 0 24 24"><path d="M12 4v12M6 10l6 6 6-6M4 20h16"/></symbol>
+<symbol id=ic-x viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol><symbol id=ic-moon viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4 8 8 0 1 0 20 14.5z"/></symbol>
+<symbol id=ic-print viewBox="0 0 24 24"><path d="M6 9V3h12v6M6 18H4v-7h16v7h-2M7 14h10v7H7z"/></symbol><symbol id=ic-chart viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></symbol>
+<symbol id=ic-box viewBox="0 0 24 24"><path d="M3 7l9-4 9 4v10l-9 4-9-4zM3 7l9 4 9-4M12 11v10"/></symbol><symbol id=ic-filter viewBox="0 0 24 24"><path d="M3 5h18l-7 8v6l-4-2v-4z"/></symbol></svg>
+<header><div class=logo><svg viewBox="0 0 24 24"><path d="M12 2l8 3v6c0 5-3.4 9.4-8 11-4.6-1.6-8-6-8-11V5z" fill="#fff"/><path d="M8.5 12l2.5 2.5 4.5-5" stroke="#1d3a8a" stroke-width="2" fill="none" stroke-linecap="round"/></svg></div>
+<div class=brand><b>Splunk UF Deployer</b><span>Windows · Linux · Sysmon · auditd · Cisco</span></div>
+<div class=nav><button id=nd class=on onclick="view('d')">Deploy</button><button id=nh onclick="view('h')">History &amp; Reports</button></div>
+<button class=thm onclick=theme() title="Toggle light / dark"><svg class=i><use href="#ic-moon"/></svg></button></header>
+<main><div id=vd style="display:grid;gap:16px">
+<div class=g2>
+<div class=card><h3><span class=n>1</span>Targets<span class=x id=tc></span></h3>
+<textarea id=t rows=8 oninput=cnt() placeholder="10.0.0.5&#10;10.0.1.0/24&#10;10.0.2.10-10.0.2.40&#10;10.0.3.7,DOMAIN\admin,Pa$$w0rd      (own credentials)&#10;10.0.4.0/24 @servers              (credential profile)&#10;lin:10.0.5.9,ubuntu,pass          (force OS for this line)"></textarea>
+<div class=bar style="margin-top:8px;align-items:center"><input type=file id=csv accept=.csv,.txt style="max-width:250px"><span class=hint>Load CSV: host,user,password per line</span></div></div>
+<div class=card><h3><span class=n>2</span>Credentials</h3>
+<div class=g3 style="grid-template-columns:1fr 1fr"><div><label>Default user</label><input id=u placeholder="DOMAIN\admin" autocomplete=off></div><div><label>Default password</label><input id=p type=password autocomplete=new-password></div></div>
+<label style="margin-top:10px">Profiles — name,user,password (one per line)</label>
+<textarea id=prof rows=3 placeholder="servers,root_ops,pass1&#10;domain,CORP\svc,pass2"></textarea>
+<details><summary>Options (Windows method, indexer, UF admin password)</summary><div class=g3 style="grid-template-columns:1fr 1fr">
+<div><label>Windows method</label><select id=method><option value=auto>Auto (WinRM → SMB)</option><option value=winrm>WinRM only</option><option value=smb>SMB + task only</option></select></div>
+<div><label title="Windows targets download files from this address">Tool address (reachable by targets)</label><input id=base placeholder="http://this-pc-ip:5000"></div>
+<div><label>Indexer ip:9997</label><input id=idx placeholder="10.0.0.20:9997"></div><div><label>UF admin password (≥8 chars)</label><input id=ap type=password autocomplete=new-password></div></div>
+<div class=hint style="margin-top:6px">Credentials are used only for the run and are never stored.</div></details></div>
+<div class=card><h3><span class=n>3</span>Files library<span class=x id=fc></span></h3>
+<div id=drop class=drop onclick="lib.click()"><svg class=i><use href="#ic-up"/></svg><b>Upload your files once</b><br><span class=hint>click or drag &amp; drop — UF packages, Sysmon, configs, rules, apps</span></div><input type=file id=lib multiple hidden>
+<div id=fl class=fl></div></div>
+</div>
+<div class=card><h3><span class=n>4</span>Task</h3><div class=bar>
+<div><label>Platform</label><div class=seg><button id=b_auto onclick="setOs('auto')">Auto</button><button id=b_windows class=on onclick="setOs('windows')">Windows</button><button id=b_linux onclick="setOs('linux')">Linux</button><button id=b_cisco onclick="setOs('cisco')">Cisco</button></div></div>
+<div style="min-width:260px;flex:1;max-width:380px"><label>Task</label><select id=task onchange=upd()></select></div>
+<div id=wsv class=hid><label>Service</label><select id=svc></select></div><div id=wop class=hid><label>Action</label><select id=op><option>status</option><option>start</option><option>stop</option><option>restart</option></select></div>
+<div id=w1 class=hid><label id=l1></label><div class=f><select id=f></select><button class=sec onclick="pick('f')" title="Upload a file"><svg class=i><use href="#ic-up"/></svg></button></div></div>
+<div id=w2 class=hid><label id=l2></label><div class=f><select id=f2></select><button class=sec onclick="pick('f2')" title="Upload a file"><svg class=i><use href="#ic-up"/></svg></button></div></div>
+<div id=wk class=hid style="min-width:0"><label>&nbsp;</label><label style="font-size:12.5px;color:var(--tx);font-weight:500;display:flex;gap:6px;align-items:center;padding:8px 0"><input type=checkbox id=kill checked> kill blocking apt/yum process</label></div>
+<input type=file id=up hidden>
+<div style="min-width:0;margin-left:auto;display:flex;gap:8px"><button id=run class=big onclick=go() title="Ctrl+Enter"><svg class=i><use href="#ic-play"/></svg>Run</button><button id=can class="cancel big" onclick=cancel() disabled><svg class=i><use href="#ic-stop"/></svg>Cancel</button></div></div>
+<div id=cis class=hid style="margin-top:14px;padding-top:14px;border-top:1px solid var(--bd)"><div class=g3 style="grid-template-columns:repeat(5,1fr)">
+<div><label>Syslog server IP</label><input id=sl></div><div><label>Protocol</label><select id=cp onchange="cport.value=cp.value=='telnet'?23:22"><option>ssh</option><option>telnet</option></select></div>
+<div><label>Port</label><input id=cport value=22></div><div><label>Enable password (optional)</label><input id=cen type=password autocomplete=new-password></div>
+<div><label>Template</label><select id=tp onchange=loadTpl()></select></div></div>
+<label style="margin-top:10px">Commands (use {syslog_ip}) — 'configure terminal', 'end' and 'write memory' are added automatically</label>
+<textarea id=ct rows=6>logging host {syslog_ip}
+logging trap informational
+logging origin-id hostname
+service timestamps log datetime msec
+logging buffered 64000
+archive
+ log config
+  logging enable
+  notify syslog contenttype plaintext</textarea>
+<div class=bar style="margin-top:8px"><input id=tn placeholder="template name" style="max-width:200px"><button class=sec onclick=saveTpl()>Save template</button><button class=sec onclick=delTpl()>Delete selected</button></div></div></div>
+<div id=err class=err></div>
+<div class=card><h3>Results<span class=x id=rs></span></h3><div class=pbw><div class=pb><i id=pb></i></div><span id=pt></span></div><div id=out><div class=empty><svg class=i><use href="#ic-box"/></svg>Nothing run yet — pick targets and a task, then press <b>Run</b>.</div></div></div>
+</div>
+<div id=vh class=hid style="display:grid;gap:16px"><div class=card><h3><svg class=i><use href="#ic-filter"/></svg>History &amp; report filters</h3><div class=bar>
+<div><label>From</label><input type=date id=hf></div><div><label>To</label><input type=date id=ht></div>
+<div><label>Platform</label><select id=hos><option value="">All</option><option>windows</option><option>linux</option><option>cisco</option></select></div>
+<div><label>Task starts with</label><input id=htask placeholder="svc, audit..."></div><div><label>Status</label><select id=hst><option value="">All</option><option>ok</option><option>fail</option></select></div>
+<div style="flex:1"><label>Search host / output</label><input id=hq onkeydown="if(event.key=='Enter')loadH()"></div></div>
+<div class=bar style="margin-top:12px"><div style="min-width:170px"><label>Server group</label><select id=hg onchange=loadGrp()></select></div>
+<div style="flex:1;min-width:280px"><label>Addresses (IP, CIDR 10.0.1.0/24, range 10.0.1.5-10.0.1.40, hostname*) — one per line or comma</label><textarea id=hh rows=2></textarea></div>
+<div style="min-width:0;display:flex;gap:8px;align-items:end;flex-wrap:wrap"><input id=gn placeholder="group name" style="width:150px"><button class=sec onclick=saveGrp()>Save group</button><button class=sec onclick=delGrp()>Delete group</button></div></div>
+<div class=bar style="margin-top:14px;padding-top:14px;border-top:1px solid var(--bd)"><button onclick=loadH()><svg class=i><use href="#ic-filter"/></svg>Filter</button><button class=sec onclick="exp('/api/history.csv')"><svg class=i><use href="#ic-down"/></svg>CSV</button><button class=sec onclick="exp('/report')"><svg class=i><use href="#ic-print"/></svg>Technical report</button>
+<div style="min-width:0;margin-left:auto"><label>Report language</label><select id=hl><option value=fa>فارسی</option><option value=en>English</option></select></div><button onclick="exp('/report/exec')"><svg class=i><use href="#ic-chart"/></svg>Management report</button></div></div>
+<div class=card><h3>Management report branding</h3><div class=bar>
+<div><label>Company / organization</label><input id=bc></div><div style="min-width:260px"><label>Report title (empty = default)</label><input id=bt></div><div><label>Prepared by</label><input id=bb></div>
+<div style="min-width:0"><label>Logo</label><div class=f style="align-items:center"><button class=sec onclick="blogo.click()"><svg class=i><use href="#ic-up"/></svg>Upload logo</button><span id=bl2 class=hint></span></div><input type=file id=blogo accept="image/*" hidden></div>
+<button onclick=saveBr()>Save branding</button><button class=sec onclick=clrLogo()>Remove logo</button></div></div>
+<div class=card><h3>Records<span class=x id=hn></span></h3><div id=ht2 class=hint>No data</div></div></div></main><div id=toast></div><script>
+const SV={windows:['splunk','sysmon'],linux:['splunk','auditd','sysmon'],auto:['splunk']};
+const T={
+windows:{'Inspect':[['check','Check Splunk UF + Sysmon'],['detect','Detect OS / system info']],
+ 'Install':[['install_uf','Install Splunk UF (.msi)','UF installer (.msi)','Initial conf (optional)'],['sysmon','Sysmon install / update config','Sysmon config (xml)','Sysmon.exe (if missing)']],
+ 'Configure':[['push_conf','Push conf → etc\\system\\local','Conf file'],['deploy_app','Deploy App / Add-on → etc\\apps','App (.tgz/.spl/.zip)']],'Service':[['svc','Service control (Splunk / Sysmon)']]},
+linux:{'Inspect':[['check','Check UF + auditd'],['detect','Detect distro / system info']],
+ 'Install':[['install_uf','Install / finish Splunk UF setup','UF package (.tgz/.rpm/.deb)','Initial conf (optional)'],['auditd','Install auditd (apt / yum / dnf / zypper)','','','k']],
+ 'Configure':[['audit_rules','Update audit rules (auto-remove bad)','Audit rules file'],['push_conf','Push conf → etc/system/local','Conf file'],['deploy_app','Deploy App / Add-on → etc/apps','App (.tgz/.spl/.zip)']],'Service':[['svc','Service control (Splunk / auditd / Sysmon)']]},
+auto:{'Detect':[['detect','Detect OS (auto by open ports)'],['check','Check Splunk / Sysmon / auditd']],'Service':[['svc','Splunk service control']]},
+cisco:{'Cisco':[['c_test','Connectivity test + syslog status'],['c_apply','Apply syslog / logging configuration']]}};
+let os='windows',jid=null,tm=null,pk=null,FL=[],flt='';const $=i=>document.getElementById(i);$('base').value=location.origin;
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const cl=s=>s.replace(/#< CLIXML/g,'').replace(/<Objs[\s\S]*?<\/Objs>/g,'').trim();
+const FAIL=/^(ERROR|CANCELLED)/m,J={'Content-Type':'application/json'};
+const post=(u,b)=>fetch(u,{method:'POST',headers:J,body:JSON.stringify(b)});
+function toast(m,k=''){const d=document.createElement('div');d.className=k;d.textContent=m;$('toast').append(d);setTimeout(()=>d.remove(),3500)}
+function theme(){const r=document.documentElement,dk=r.dataset.theme?r.dataset.theme=='dark':matchMedia('(prefers-color-scheme:dark)').matches;r.dataset.theme=dk?'light':'dark';try{localStorage.ufdTheme=r.dataset.theme}catch(e){}}
+try{if(localStorage.ufdTheme)document.documentElement.dataset.theme=localStorage.ufdTheme}catch(e){}
+function view(v){$('vd').classList.toggle('hid',v!='d');$('vh').classList.toggle('hid',v!='h');$('nd').className=v=='d'?'on':'';$('nh').className=v=='h'?'on':'';if(v=='h')loadH()}
+function cnt(){const n=$('t').value.split('\n').filter(l=>l.trim()&&!l.trim().startsWith('#')).length;$('tc').textContent=n?n+' line'+(n>1?'s':''):''}
+function setOs(o){os=o;for(const k of['auto','windows','linux','cisco'])$('b_'+k).className=k==o?'on':'';
+$('task').innerHTML=Object.entries(T[o]).map(([g,l])=>`<optgroup label="${g}">`+l.map(x=>`<option value=${x[0]} data-f="${x[2]||''}" data-f2="${x[3]||''}" data-k="${x[4]||''}">${x[1]}</option>`).join('')+'</optgroup>').join('');
+$('svc').innerHTML=(SV[o]||[]).map(s=>`<option>${s}</option>`).join('');$('cis').classList.toggle('hid',o!='cisco');upd()}
+function upd(){const o=$('task').selectedOptions[0],t=$('task').value;$('w1').classList.toggle('hid',!o.dataset.f);$('l1').textContent=o.dataset.f;
+$('w2').classList.toggle('hid',!o.dataset.f2);$('l2').textContent=o.dataset.f2;$('wsv').classList.toggle('hid',t!='svc');$('wop').classList.toggle('hid',t!='svc');
+$('wk').classList.toggle('hid',!(t=='auditd'||(t=='install_uf'&&os=='linux')));sel()}
+const EXT={f:{install_uf:/\.(msi|tgz|rpm|deb|gz)$/i,sysmon:/\.xml$/i,audit_rules:/\.(rules|txt|conf)$/i,push_conf:/\.conf$/i,deploy_app:/\.(tgz|spl|zip|gz)$/i},f2:{sysmon:/\.exe$/i,install_uf:/\.conf$/i}};
+function sel(){const t=$('task').value;for(const k of['f','f2']){const r=EXT[k][t],c=$(k).value,opt=k=='f2'&&(t=='install_uf'||t=='sysmon');const m=r?FL.find(n=>r.test(n)):'';
+$(k).innerHTML=(opt?'<option value="">(none)</option>':'')+FL.map(n=>`<option ${n==c?'selected':''}>${esc(n)}</option>`).join('');
+if(!c||!FL.includes(c)||(r&&!r.test(c)))$(k).value=(opt&&t=='install_uf')?'':(m||(opt?'':FL[0])||'')}}
+const sz=b=>b>1048576?(b/1048576).toFixed(1)+' MB':Math.ceil(b/1024)+' KB';
+async function renderLib(){const l=await (await fetch('/api/filelist')).json();$('fc').textContent=l.length?l.length+' file'+(l.length>1?'s':''):'';
+$('fl').innerHTML=l.length?l.map(x=>{const e=(x[0].match(/\.([^.]+)$/)||['',''])[1].slice(0,5);return `<div class=fi><span class=ext>${esc(e||'file')}</span><span class=nm title="${esc(x[0])}">${esc(x[0])}</span><span class=hint>${sz(x[1])}</span><button class=del title="Delete" onclick="delF(decodeURIComponent('${encodeURIComponent(x[0])}'))"><svg class=i><use href="#ic-x"/></svg></button></div>`}).join(''):'<div class=hint style="padding:8px 4px">No files yet</div>'}
+async function delF(n){if(!confirm('Delete '+n+' from the library?'))return;await post('/api/delete',{name:n});files();toast('Deleted '+n)}
+async function upl(fs){if(!fs.length)return;const d=new FormData();for(const f of fs)d.append('f',f);const r=await fetch('/api/upload',{method:'POST',body:d});await files();toast(r.ok?`Uploaded ${fs.length} file(s)`:'Upload failed',r.ok?'o':'e')}
+$('lib').onchange=async()=>{await upl($('lib').files);$('lib').value=''};
+const dz=$('drop');dz.ondragover=e=>{e.preventDefault();dz.classList.add('ov')};dz.ondragleave=()=>dz.classList.remove('ov');dz.ondrop=async e=>{e.preventDefault();dz.classList.remove('ov');await upl(e.dataTransfer.files)};
+async function files(){renderLib();FL=await (await fetch('/api/files')).json();sel()}
+function pick(k){pk=k;$('up').click()}
+$('up').onchange=async()=>{const fs=$('up').files;if(!fs.length)return;const n=fs[0].name;await upl(fs);$(pk).value=n;$('up').value=''};
+$('csv').onchange=async e=>{$('t').value=await e.target.files[0].text();cnt()};
+async function tpls(){window.TP=await (await fetch('/api/templates')).json();$('tp').innerHTML='<option value="">— default —</option>'+Object.keys(TP).map(n=>`<option>${esc(n)}</option>`).join('')}
+function loadTpl(){if(TP[$('tp').value])$('ct').value=TP[$('tp').value]}
+async function saveTpl(){if($('tn').value.trim()){await post('/api/templates',{name:$('tn').value.trim(),text:$('ct').value});await tpls();toast('Template saved','o')}}
+async function delTpl(){if($('tp').value){await post('/api/templates',{name:$('tp').value,text:''});tpls();toast('Template deleted')}}
+function busy(b){$('run').disabled=b;$('can').disabled=!b}
+async function go(){$('err').textContent='';if(!$('t').value.trim()){$('err').textContent='Enter at least one target (IP / hostname / CIDR).';return}
+busy(true);flt='';$('out').innerHTML='<div class=empty>Starting…</div>';let r,j;
+try{r=await post('/api/run',{os,action:$('task').value,targets:$('t').value,user:$('u').value,pass:$('p').value,profiles:$('prof').value,method:$('method').value,base:$('base').value,idx:$('idx').value,apass:$('ap').value,file:$('f').value,file2:$('f2').value,svc:$('svc').value,op:$('op').value,kill:$('kill').checked,syslog:$('sl').value,cproto:$('cp').value,cport:$('cport').value,cenable:$('cen').value,ctext:$('ct').value});j=await r.json()}
+catch(e){r={ok:false};j={error:'Cannot reach the UF Deployer server: '+e.message}}
+if(!r.ok){$('err').textContent=j.error||'Request failed';busy(false);$('out').innerHTML='';return}
+jid=j.id;clearInterval(tm);tm=setInterval(poll,1200);poll()}
+async function cancel(){if(jid)await fetch('/api/cancel/'+jid,{method:'POST'});poll()}
+function setF(f){flt=flt==f?'':f;poll()}
+async function poll(){let j;try{j=await (await fetch('/api/job/'+jid)).json()}catch(e){return}const R=j.results||{},H=j.hosts||[];const n=Object.keys(R).length;
+const bad=Object.values(R).filter(v=>FAIL.test(v)).length,run=H.length-n,done=!H.length||n>=H.length;
+$('pb').style.width=(H.length?100*n/H.length:100)+'%';$('pt').textContent=`${n} / ${H.length}`;
+const ch=(k,c,t)=>`<span class="chip ${k} ${flt==k?'sel':''}" onclick="setF('${k}')">${c} ${t}</span>`;
+$('out').innerHTML=`<div class=chips>${ch('ok',n-bad,'succeeded')}${ch('bad',bad,'failed')}${ch('run',run,'running')}${flt?'<span class=hint>filtered — click the chip again to show all</span>':''}</div>`+
+H.map(h=>{const v=R[h],st=v===undefined?'run':FAIL.test(v)?'bad':'ok';if(flt&&flt!=st)return'';const t=cl(v||'running…'),last=t.split('\n').filter(x=>x.trim()).pop()||'';
+return `<details class="r ${st}" ${v!==undefined&&(st=='bad'||H.length<4)?'open':''}><summary><i class=dot></i><b>${esc(h)}</b><span>${esc(last)}</span></summary><pre>${esc(t)}</pre></details>`}).join('');
+if(done){clearInterval(tm);busy(false);$('rs').textContent=new Date().toLocaleTimeString();if(H.length&&tm){toast(bad?`Finished — ${bad} of ${H.length} failed`:`Finished — all ${H.length} succeeded`,bad?'e':'o');tm=null}}}
+document.addEventListener('keydown',e=>{if(e.ctrlKey&&e.key=='Enter'&&!$('run').disabled&&!$('vd').classList.contains('hid'))go()});
+const hq=()=>new URLSearchParams({lang:$('hl').value,hosts:$('hh').value,group:$('hg').value,frm:$('hf').value,to:$('ht').value,os:$('hos').value,task:$('htask').value,status:$('hst').value,q:$('hq').value});
+async function loadH(){const r=await (await fetch('/api/history?'+hq())).json();$('hn').textContent=r.length+' record'+(r.length==1?'':'s')+(r.length>=5000?' (latest 5000)':'');
+$('ht2').innerHTML=r.length?'<div class=tw><table><thead><tr><th>Time</th><th>Client</th><th>OS</th><th>Host</th><th>Task</th><th>Status</th><th>Output</th></tr></thead><tbody>'+r.map(x=>{const o=cl(x[6]),l=o.split('\n').filter(s=>s.trim()).pop()||'';
+return `<tr><td style="white-space:nowrap">${esc(x[0])}</td><td>${esc(x[1])}</td><td>${esc(x[2])}</td><td><b>${esc(x[3])}</b></td><td>${esc(x[4])}</td><td><span class="pill ${esc(x[5])}">${esc(x[5])}</span></td><td><details><summary style="margin:0;font-weight:500;color:var(--mut)">${esc(l.slice(0,90))||'view'}</summary><pre>${esc(o)}</pre></details></td></tr>`}).join('')+'</tbody></table></div>':'<div class=empty>No records match these filters</div>'}
+const exp=u=>window.open(u+'?'+hq(),'_blank');
+async function grps(){window.GR=await (await fetch('/api/groups')).json();$('hg').innerHTML='<option value="">— all servers —</option>'+Object.keys(GR).map(n=>`<option>${esc(n)}</option>`).join('')}
+function loadGrp(){$('gn').value=$('hg').value;if(GR[$('hg').value])$('hh').value=GR[$('hg').value]}
+async function saveGrp(){const n=$('gn').value.trim();if(!n)return;await post('/api/groups',{name:n,text:$('hh').value});await grps();$('hg').value=n;toast('Group saved','o')}
+async function delGrp(){if($('hg').value){await post('/api/groups',{name:$('hg').value,text:''});$('hh').value='';await grps();toast('Group deleted')}}
+async function brand(){const b=await (await fetch('/api/branding')).json();$('bc').value=b.company||'';$('bt').value=b.title||'';$('bb').value=b.by||'';$('bl2').textContent=b.logo?'✓ logo set':''}
+async function saveBr(){await post('/api/branding',{company:$('bc').value,title:$('bt').value,by:$('bb').value});brand();toast('Branding saved','o')}
+async function clrLogo(){await post('/api/branding',{logo:''});brand()}
+$('blogo').onchange=async()=>{const d=new FormData();d.append('f',$('blogo').files[0]);const r=await fetch('/api/logo',{method:'POST',body:d});if(!r.ok)toast((await r.json()).error,'e');$('blogo').value='';brand()};
+setOs('windows');files();tpls();grps();brand();cnt();
+</script></body></html>

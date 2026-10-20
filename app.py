@@ -1,1340 +1,626 @@
-"""UF Deployer - web UI + FastAPI backend to deploy Splunk UF / Sysmon / auditd.
-Run:  python app.py   ->  http://127.0.0.1:8000
-"""
-import csv, io, ipaddress, json, os, re, secrets, shlex, shutil, socket, sqlite3
-import subprocess, tempfile, threading, time, uuid
+# Splunk UF Deployer - run: pip install -r requirements.txt ; python app.py [port] [--no-browser] ; open http://localhost:5000
+import fnmatch, ipaddress, re, shlex, subprocess, socket, sqlite3, csv, io, html, json, time, uuid, os, sys, threading, webbrowser
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional
+from contextlib import closing
+from urllib.parse import quote as urlq, urlsplit, urlunsplit
+from flask import Flask, request, jsonify, send_from_directory, abort
+import winrm, paramiko
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
-
-import sys, base64, getpass, hashlib
 FROZEN = getattr(sys, "frozen", False)
-BASE = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))  # bundled resources
-DATA = (os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "UFDeployer")
-        if FROZEN else BASE)  # writable folder (installed exe may live in Program Files)
-os.makedirs(DATA, exist_ok=True)
-DB = os.path.join(DATA, "history.db")
-MAX_HOSTS, WORKERS = 1024, 10
-PORT = 8000
-app = FastAPI(title="UF Deployer")
+HERE = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))   # bundled files (index.html)
+ROOT = os.path.dirname(sys.executable) if FROZEN else HERE                    # data/ must not live in the exe's temp dir
+app = Flask(__name__)
+DATA = os.path.join(ROOT, "data"); os.makedirs(DATA, exist_ok=True)
+POOL = ThreadPoolExecutor(20); JOBS = {}; LOCK = threading.Lock(); MAX_HOSTS = 4096
+DB = os.path.join(DATA, "history.db"); TPL = os.path.join(DATA, "templates.json")
+dbc = lambda: closing(sqlite3.connect(DB, timeout=30))
+with dbc() as _d, _d: _d.execute("create table if not exists h(ts text,client text,os text,host text,task text,status text,output text)")
+BRAND = os.path.join(DATA, "branding.json"); GRP = os.path.join(DATA, "groups.json")
+EXCL = {"history.db", "templates.json", "branding.json", "groups.json"}
+visible = lambda n: n not in EXCL and not n.startswith(("logo.", ".")) and not n.endswith(".tmp")
+WUF = r"C:\Program Files\SplunkUniversalForwarder"; LUF = "/opt/splunkforwarder"
+WLOCAL = WUF + r"\etc\system\local"; WAPPS = WUF + r"\etc\apps"
+FAIL = re.compile(r"^(ERROR|CANCELLED)", re.M)
+OPS = ("status", "start", "stop", "restart")
 
-
-# ───────────────────────── request guard (CSRF / DNS rebinding) ─────────────────────────
-# Any web page open in the browser can send simple POSTs to 127.0.0.1, so every API call must
-# carry a per-run secret: a SameSite=Strict cookie (all /api requests) plus a custom header
-# (state-changing requests; a cross-site page cannot add it without a CORS preflight we never allow).
-TOKEN = secrets.token_urlsafe(32)
-HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
-ORIGINS = {f"http://{h}" for h in HOSTS}
-
-
-@app.middleware("http")
-async def guard(request: Request, call_next):
-    if request.headers.get("host", "") not in HOSTS:
-        return JSONResponse({"detail": "invalid Host header"}, 400)
-    if request.url.path.startswith("/api/"):
-        if not secrets.compare_digest(request.cookies.get("ufd", ""), TOKEN):
-            return JSONResponse({"detail": "session expired - reload the page"}, 403)
-        if request.method not in ("GET", "HEAD"):
-            origin = request.headers.get("origin")
-            if (origin and origin not in ORIGINS) or \
-                    not secrets.compare_digest(request.headers.get("x-ufd-token", ""), TOKEN):
-                return JSONResponse({"detail": "request rejected (missing or invalid token)"}, 403)
-    return await call_next(request)
-
-
-# ───────────────────────── history (SQLite) ─────────────────────────
-def db():
-    c = sqlite3.connect(DB)
-    c.execute("""CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY, ts TEXT, ip TEXT,
-                 os TEXT, service TEXT, operation TEXT, ok INTEGER, message TEXT)""")
+def jload(p):
     try:
-        c.execute("ALTER TABLE history ADD COLUMN operator TEXT")
-    except sqlite3.OperationalError:
-        pass
-    return c
+        with open(p, encoding="utf-8") as fh: return json.load(fh)
+    except (OSError, ValueError): return {}
+def jsave(p, o):
+    with open(p + ".tmp", "w", encoding="utf-8") as fh: json.dump(o, fh)
+    os.replace(p + ".tmp", p); return o
 
-
-def db_add(ip, os_, svc, op, ok, msg, operator=""):
-    with db() as c:
-        c.execute("INSERT INTO history(ts,ip,os,service,operation,ok,message,operator) VALUES(?,?,?,?,?,?,?,?)",
-                  (time.strftime("%Y-%m-%d %H:%M:%S"), ip, os_, svc, op, int(ok), (msg or "")[:4000], operator))
-
-
-def query_history(df="", dt="", os_="", svc="", status="", q=""):
-    sql, p = "SELECT ts,ip,os,service,operation,ok,message,operator FROM history WHERE 1=1", []
-    if df: sql += " AND ts>=?"; p.append(df)
-    if dt: sql += " AND ts<=?"; p.append(dt + " 23:59:59")
-    if os_: sql += " AND os=?"; p.append(os_)
-    if svc: sql += " AND service=?"; p.append(svc)
-    if status == "ok": sql += " AND ok=1"
-    if status == "fail": sql += " AND ok=0"
-    if q:
-        sql += " AND (ip LIKE ? OR operation LIKE ? OR message LIKE ?)"; p += [f"%{q}%"] * 3
-    with db() as c:
-        return c.execute(sql + " ORDER BY id DESC LIMIT 5000", p).fetchall()
-
-
-# ───────────────────────── jobs ─────────────────────────
-class Cancelled(Exception):
-    pass
-
-
-class Job:
-    def __init__(self):
-        self.id = uuid.uuid4().hex[:10]
-        self.lines, self.done = [], False
-        self.cancel = threading.Event()
-        self.dir = tempfile.mkdtemp(prefix="ufd_")
-
-    def log(self, ip, lvl, msg):
-        for l in (str(msg).splitlines() or [""]):
-            self.lines.append({"t": time.strftime("%H:%M:%S"), "ip": ip, "lvl": lvl, "msg": l})
-
-    def check(self):
-        if self.cancel.is_set():
-            raise Cancelled()
-
-
-OPERATOR = getpass.getuser()
-JOBS: dict = {}
-ACTIONS: dict = {}
-
-
-def action(os_, name, svc):
-    def deco(f):
-        ACTIONS[(os_, name)] = (f, svc)
-        return f
-    return deco
-
-
-# ───────────────────────── helpers ─────────────────────────
-def ping(ip):
-    nt = os.name == "nt"
-    cmd = ["ping", "-n", "1", "-w", "1000", ip] if nt else ["ping", "-c", "1", "-W", "1", ip]
+# ---------- target parsing ----------
+# Line formats:  host | CIDR | a.b.c.1-a.b.c.20 | host,user,password | host @profile | win:host... | lin:host...
+def expand(spec):
+    spec = spec.strip()
     try:
-        return subprocess.run(cmd, capture_output=True, timeout=5).returncode == 0
-    except Exception:
-        return False
-
-
-def port_open(ip, port, timeout=3):
-    try:
-        with socket.create_connection((ip, int(port)), timeout=timeout):
-            return True
-    except Exception:
-        return False
-
-
-def parse_targets(mode, text, csv_bytes, d):
-    rows = []
-    text = (text or "").strip()
-    if mode == "single":
-        rows = [{"ip": text}]
-    elif mode == "range":
-        if "/" in text:
-            rows = [{"ip": str(i)} for i in ipaddress.ip_network(text, strict=False).hosts()]
-        elif "-" in text:
-            a, b = [x.strip() for x in text.split("-", 1)]
-            end = b if "." in b else a.rsplit(".", 1)[0] + "." + b
-            rows = [{"ip": str(ipaddress.ip_address(i))}
-                    for i in range(int(ipaddress.ip_address(a)), int(ipaddress.ip_address(end)) + 1)]
-        else:
-            raise ValueError("range must be CIDR (10.0.0.0/24) or 10.0.0.1-10.0.0.20")
-    elif mode == "csv":
-        rd = csv.DictReader(io.StringIO(csv_bytes.decode("utf-8-sig")))
-        for r in rd:
-            r = {(k or "").strip().lower(): (v or "").strip() for k, v in r.items()}
-            if r.get("ip"):
-                rows.append({"ip": r["ip"], "port": r.get("port"), "user": r.get("username"),
-                             "pass": r.get("password"), "auth": r.get("auth_type") or r.get("auth")})
-    if not rows or not rows[0]["ip"]:
-        raise ValueError("no targets")
-    if len(rows) > MAX_HOSTS:
-        raise ValueError(f"max {MAX_HOSTS} hosts")
-    return [{"ip": r["ip"], "port": r.get("port") or d["port"], "user": r.get("user") or d["user"],
-             "pass": r.get("pass") or d["pass"], "auth": (r.get("auth") or d["auth"]).lower(),
-             "key": d["key"], "sudo_pass": d["sudo_pass"], "enable": d.get("enable", ""),
-             "verify": d.get("verify", False)} for r in rows]
-
-
-PATHFIX = "export PATH=$PATH:/usr/sbin:/sbin:/usr/local/sbin; "
-
-
-# ---- SSH host keys: trust on first use, refuse a changed key ----
-KNOWN_HOSTS = os.path.join(DATA, "known_hosts")
-_kh_lock = threading.Lock()
-
-
-def _load_known():
-    import paramiko
-    hk = paramiko.HostKeys()
-    with _kh_lock:
-        if os.path.isfile(KNOWN_HOSTS):
-            hk.load(KNOWN_HOSTS)
-    return hk
-
-
-def trust_host_key(name, key, log):
-    """Remember the key of a host seen for the first time; raise if a known host shows another key."""
-    import paramiko
-    fp = "SHA256:" + base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
-    with _kh_lock:
-        hk = paramiko.HostKeys()
-        if os.path.isfile(KNOWN_HOSTS):
-            hk.load(KNOWN_HOSTS)
-        known = hk.lookup(name)
-        if known:
-            if known.get(key.get_name()) != key:
-                raise RuntimeError(f"SSH HOST KEY CHANGED for {name} (now {key.get_name()} {fp}) - possible "
-                                   f"man-in-the-middle. If the host was really reinstalled, delete its line from "
-                                   f"{KNOWN_HOSTS}")
-            return
-        hk.add(name, key.get_name(), key)
-        hk.save(KNOWN_HOSTS)
-    log(f"new SSH host key saved: {key.get_name()} {fp}")
-
-
-def ssh_precheck(ip, port, log):
-    """Fetch and verify the host key before any password is sent (used for netmiko connections)."""
-    import paramiko
-    name = ip if port == 22 else f"[{ip}]:{port}"
-    known = list(_load_known().lookup(name) or {})
-    t = paramiko.Transport(socket.create_connection((ip, port), timeout=15))
-    try:
-        if known:
-            o = t.get_security_options()
-            o.key_types = tuple(known + [k for k in o.key_types if k not in known])
-        t.start_client(timeout=15)
-        key = t.get_remote_server_key()
-    finally:
-        t.close()
-    trust_host_key(name, key, log)
-
-
-# ---- SMB admin share without putting the password on a command line ----
-_smb_lock = threading.Lock()
-_smb_refs: dict = {}
-_smb_host_locks: dict = {}
-
-
-def _smb_api():
-    import ctypes
-    from ctypes import wintypes
-
-    class NETRESOURCE(ctypes.Structure):
-        _fields_ = [("dwScope", wintypes.DWORD), ("dwType", wintypes.DWORD), ("dwDisplayType", wintypes.DWORD),
-                    ("dwUsage", wintypes.DWORD), ("lpLocalName", wintypes.LPWSTR),
-                    ("lpRemoteName", wintypes.LPWSTR), ("lpComment", wintypes.LPWSTR),
-                    ("lpProvider", wintypes.LPWSTR)]
-    return ctypes, NETRESOURCE
-
-
-def smb_open(unc, user, pw):
-    """Connect to \\\\host\\C$ (ref-counted so parallel jobs on one host don't drop each other's session)."""
-    with _smb_lock:
-        hl = _smb_host_locks.setdefault(unc, threading.Lock())
-    with hl:
-        if _smb_refs.get(unc):
-            _smb_refs[unc] += 1
-            return
-        ctypes, NETRESOURCE = _smb_api()
-        nr = NETRESOURCE(dwType=1, lpRemoteName=unc)  # RESOURCETYPE_DISK
-        rc = ctypes.windll.mpr.WNetAddConnection2W(ctypes.byref(nr), pw or None, user or None, 0)
-        if rc:
-            hint = (" - this PC already has a connection to that host with other credentials (see 'net use')"
-                    if rc == 1219 else "")
-            raise RuntimeError(f"SMB connect to {unc} failed: {ctypes.FormatError(rc).strip()} ({rc}){hint}")
-        _smb_refs[unc] = 1
-
-
-def smb_close(unc):
-    with _smb_lock:
-        hl = _smb_host_locks.setdefault(unc, threading.Lock())
-    with hl:
-        _smb_refs[unc] = _smb_refs.get(unc, 1) - 1
-        if _smb_refs[unc] <= 0:
-            _smb_refs.pop(unc, None)
-            ctypes, _ = _smb_api()
-            ctypes.windll.mpr.WNetCancelConnection2W(unc, 0, True)
-
-
-class Ctx:
-    def __init__(self, job, t, p, files, os_):
-        self.job, self.t, self.p, self.files, self.os = job, t, p, files, os_
-        self._ws = self._ssh = self._net = None
-
-    def log(self, m): self.job.log(self.t["ip"], "INFO", m)
-    def step(self, m): self.job.check(); self.log(m)
-
-    def close(self):
-        if self._ssh:
-            self._ssh.close()
-        if self._net:
-            try:
-                self._net.disconnect()
-            except Exception:
-                pass
-
-    # ---- Windows (WinRM for exec, SMB admin share for file copy) ----
-    def ws(self):
-        if not self._ws:
-            import winrm
-            port = int(self.t["port"] or 5985)
-            tr = {"ntlm": "ntlm", "basic": "basic", "kerberos": "kerberos", "credssp": "credssp",
-                  "domain": "ntlm", "workgroup": "ntlm"}.get(self.t["auth"], "ntlm")
-            https = port == 5986
-            if tr == "basic" and not https:
-                raise RuntimeError("Basic auth over HTTP (5985) sends the password in clear text - use port 5986 "
-                                   "(HTTPS) or NTLM/Kerberos")
-            self._ws = winrm.Session(f"{'https' if https else 'http'}://{self.t['ip']}:{port}/wsman",
-                                     auth=(self.t["user"], self.t["pass"]), transport=tr,
-                                     server_cert_validation="validate" if self.t.get("verify") else "ignore",
-                                     read_timeout_sec=660, operation_timeout_sec=600)
-        return self._ws
-
-    def ps(self, script):
-        self.job.check()
-        r = self.ws().run_ps(script)
-        return r.status_code, (r.std_out + r.std_err).decode("utf-8", "ignore").strip()
-
-    def smb_cp(self, local, rel):
-        if os.name != "nt":
-            raise RuntimeError("SMB copy needs this app to run on Windows")
-        unc = rf"\\{self.t['ip']}\C$"
-        smb_open(unc, self.t["user"], self.t["pass"])
-        try:
-            dst = unc + "\\" + rel
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copyfile(local, dst)
-        finally:
-            smb_close(unc)
-
-    # ---- Linux (SSH + sudo -S) ----
-    def ssh(self):
-        if not self._ssh:
-            import paramiko
-            log = self.log
-
-            class Tofu(paramiko.MissingHostKeyPolicy):
-                def missing_host_key(self, client, hostname, key):
-                    trust_host_key(hostname, key, log)
-
-            c = paramiko.SSHClient()
-            c.get_host_keys().update(_load_known())
-            c.set_missing_host_key_policy(Tofu())
-            kw = dict(hostname=self.t["ip"], port=int(self.t["port"] or 22), username=self.t["user"],
-                      timeout=15, allow_agent=False, look_for_keys=False)
-            if self.t["auth"] == "key":
-                pk = None
-                for cls in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey):
-                    try:
-                        pk = cls.from_private_key(io.StringIO(self.t["key"]), password=self.t["pass"] or None)
-                        break
-                    except Exception:
-                        continue
-                if not pk:
-                    raise RuntimeError("cannot load SSH private key")
-                kw["pkey"] = pk
-            else:
-                kw["password"] = self.t["pass"]
-            try:
-                c.connect(**kw)
-            except paramiko.BadHostKeyException as e:
-                raise RuntimeError(f"SSH HOST KEY CHANGED for {self.t['ip']} - possible man-in-the-middle. If the "
-                                   f"host was really reinstalled, delete its line from {KNOWN_HOSTS}") from e
-            self._ssh = c
-        return self._ssh
-
-    def sudo(self, cmd, timeout=900):
-        self.job.check()
-        if self.t["user"] == "root":
-            full = f"sh -c {shlex.quote(PATHFIX + cmd)} 2>&1"
-        else:
-            full = f"sudo -S -p '' sh -c {shlex.quote(PATHFIX + cmd)} 2>&1"
-        stdin, out, _ = self.ssh().exec_command(full, timeout=timeout)
-        stdin.write((self.t["sudo_pass"] or self.t["pass"] or "") + "\n")
-        stdin.flush()
-        stdin.channel.shutdown_write()
-        code = out.channel.recv_exit_status()
-        return code, out.read().decode("utf-8", "ignore").strip()
-
-    def put(self, local, dest, mode="0644"):
-        tmp = f"/tmp/.ufd_{uuid.uuid4().hex[:8]}"
-        sf = self.ssh().open_sftp()
-        try:
-            sf.put(local, tmp)
-        finally:
-            sf.close()
-        d = shlex.quote(os.path.dirname(dest))
-        return self.sudo(f"install -D -m {mode} {shlex.quote(tmp)} {shlex.quote(dest)} && "
-                         f"(chown --reference={d} {shlex.quote(dest)} 2>/dev/null; true); rm -f {shlex.quote(tmp)}")
-
-    def put_text(self, text, dest, mode="0644"):
-        p = os.path.join(self.job.dir, uuid.uuid4().hex)
-        with open(p, "w", newline="\n") as f:
-            f.write(text)
-        try:
-            return self.put(p, dest, mode)
-        finally:
-            os.remove(p)
-
-
-# ───────────────────────── Windows actions ─────────────────────────
-UF_WIN = r"C:\Program Files\SplunkUniversalForwarder"
-TMP_WIN = r"C:\Windows\Temp\ufdeploy"
-
-
-def q(s): return str(s).replace("'", "''")
-
-
-@action("windows", "connectivity", "network")
-def w_conn(c):
-    ip, res = c.t["ip"], []
-    res.append(f"ICMP: {'reply' if ping(ip) else 'no reply'}")
-    st = {p: port_open(ip, p) for p in (5985, 5986, 445)}
-    res += [f"{p}: {'open' if o else 'closed'}" for p, o in st.items()]
-    return (st[5985] or st[5986]), "  ".join(res)
-
-
-@action("windows", "uf_check", "uf")
-def w_uf_check(c):
-    _, out = c.ps('$s=Get-Service SplunkForwarder -EA SilentlyContinue; '
-                  'if($s){"INSTALLED status="+$s.Status}else{"NOT INSTALLED"}')
-    return True, out
-
-
-@action("windows", "uf_install", "uf")
-def w_uf_install(c):
-    p, f = c.p, c.files.get("main", [])
-    for k in ("share_path", "receiver", "splunk_pass"):
-        if '"' in (p.get(k) or ""):  # would break out of the quoted msiexec property
-            return False, f'{k} must not contain a double quote (")'
-    msi = p.get("share_path", "").strip()
-    if not msi:
-        if not f:
-            return False, "select a UF .msi file (or give a share path)"
-        name = os.path.basename(f[0])
-        c.step(f"copying {name} via SMB (C$)")
-        c.smb_cp(f[0], r"Windows\Temp\ufdeploy" + "\\" + name)
-        msi = TMP_WIN + "\\" + name
-    args = f'/i "{msi}" AGREETOLICENSE=Yes LAUNCHSPLUNK=1 SERVICESTARTTYPE=auto /quiet'
-    if p.get("receiver"):
-        args += f' RECEIVING_INDEXER="{p["receiver"]}"'
-    args += (f' SPLUNKUSERNAME=admin SPLUNKPASSWORD="{p["splunk_pass"]}"' if p.get("splunk_pass")
-             else " GENRANDOMPASSWORD=1")
-    c.step("running msiexec")
-    _, out = c.ps(f"$r=Start-Process msiexec.exe -ArgumentList '{q(args)}' -Wait -PassThru; \"exit=\"+$r.ExitCode")
-    return ("exit=0" in out or "exit=3010" in out), out
-
-
-@action("windows", "uf_cfg", "uf")
-def w_uf_cfg(c):
-    fs = c.files.get("cfg", [])
-    if not fs:
-        return False, "select config files (inputs.conf, outputs.conf, ...)"
-    for f in fs:
-        c.step(f"pushing {os.path.basename(f)}")
-        c.smb_cp(f, UF_WIN[3:] + r"\etc\system\local" + "\\" + os.path.basename(f))
-    if c.p.get("restart"):
-        _, out = c.ps("Restart-Service SplunkForwarder; (Get-Service SplunkForwarder).Status")
-        return True, f"{len(fs)} file(s) pushed; service {out}"
-    return True, f"{len(fs)} file(s) pushed"
-
-
-@action("windows", "uf_service", "uf")
-def w_uf_service(c):
-    op = c.p.get("op", "status")
-    cmd = {"start": "Start-Service", "stop": "Stop-Service", "restart": "Restart-Service"}.get(op)
-    _, out = c.ps((f"{cmd} SplunkForwarder -EA Stop; " if cmd else "") +
-                  "$s=Get-Service SplunkForwarder -EA SilentlyContinue; if($s){$s.Status}else{'NOT INSTALLED'}")
-    return "NOT INSTALLED" not in out and "rror" not in out, out
-
-
-SYS_FIND = "$s=Get-Service Sysmon64,Sysmon -EA SilentlyContinue | Select -First 1; "
-
-
-@action("windows", "sysmon_check", "sysmon")
-def w_sys_check(c):
-    _, out = c.ps(SYS_FIND + 'if($s){"INSTALLED "+$s.Name+" "+$s.Status}else{"NOT INSTALLED"}')
-    return True, out
-
-
-@action("windows", "sysmon_deploy", "sysmon")
-def w_sys_deploy(c):
-    exe, cfg = c.files.get("main", []), c.files.get("cfg", [])
-    if not cfg:
-        return False, "select a Sysmon XML config"
-    cn = os.path.basename(cfg[0])
-    c.step("copying files")
-    c.smb_cp(cfg[0], r"Windows\Temp\ufdeploy" + "\\" + cn)
-    en = ""
-    if exe:
-        en = os.path.basename(exe[0])
-        c.smb_cp(exe[0], r"Windows\Temp\ufdeploy" + "\\" + en)
-    c.step("installing/updating Sysmon")
-    cfgpath = TMP_WIN + "\\" + cn
-    # file names go in single quotes (no $() expansion); -accepteula on update too, because the EULA flag is
-    # per user and an admin who never ran Sysmon would otherwise get a prompt that blocks the WinRM call
-    if en:
-        fresh = f"& '{q(TMP_WIN + chr(92) + en)}' -accepteula -i $cfg 2>&1; 'INSTALLED'"
-    else:
-        fresh = "'NOT INSTALLED and no Sysmon binary supplied'; exit 1"
-    script = (SYS_FIND + f"$cfg='{q(cfgpath)}'; "
-              'if($s){ & "$env:windir\\$($s.Name).exe" -accepteula -c $cfg 2>&1; "UPDATED" } '
-              'else { ' + fresh + ' }')
-    code, out = c.ps(script)
-    return code == 0 and ("UPDATED" in out or "INSTALLED" in out) and "supplied" not in out, out
-
-
-@action("windows", "sysmon_service", "sysmon")
-def w_sys_service(c):
-    op = c.p.get("op", "status")
-    cmd = {"start": "Start-Service", "stop": "Stop-Service", "restart": "Restart-Service"}.get(op)
-    _, out = c.ps(SYS_FIND + 'if(-not $s){"NOT INSTALLED";exit 1}; ' +
-                  (f"{cmd} $s.Name -EA Stop; " if cmd else "") + "(Get-Service $s.Name).Status")
-    return "NOT INSTALLED" not in out and "rror" not in out, out
-
-
-AUDITPOL_LINE = re.compile(r'(?i)^auditpol(\.exe)?(\s+[\w/:\\".,{}* -]+)$')
-
-
-@action("windows", "audit_apply", "auditpol")
-def w_audit_apply(c):
-    lines = [l.strip() for l in c.p.get("commands", "").splitlines() if l.strip() and not l.startswith("#")]
-    if not lines:
-        return False, "enter at least one auditpol command"
-    # the line runs through PowerShell, so no ; | & $ ( ) ` @ ' < > % - nothing that could chain another command
-    bad = [l for l in lines if not AUDITPOL_LINE.match(l) or l.count('"') % 2]
-    if bad:
-        return False, "only plain auditpol commands are allowed (no ; | & $ ( ) etc.): " + bad[0]
-    fails = 0
-    for l in lines:
-        c.step(l)
-        code, out = c.ps(l)
-        if code:
-            fails += 1; c.log("ERROR: " + out)
-    return fails == 0, f"{len(lines) - fails}/{len(lines)} commands applied"
-
-
-@action("windows", "audit_report", "auditpol")
-def w_audit_report(c):
-    _, out = c.ps("auditpol /get /category:*")
-    return True, out
-
-
-# ───────────────────────── Linux actions ─────────────────────────
-UF_LIN = "/opt/splunkforwarder"
-SPL = f"{UF_LIN}/bin/splunk"
-# Any splunk CLI call on a never-started (or freshly upgraded) UF shows the license / migration prompt and
-# waits for input. Always answer non-interactively, give it no stdin and cap the run time.
-SPL_FLAGS = "--accept-license --answer-yes --no-prompt"
-# Read-only state check that never runs the splunk CLI (so it can't trigger license, first-run or migration).
-UF_STATE = (f'if [ ! -x {SPL} ]; then echo NOT INSTALLED; exit 0; fi; '
-            f'sed -n "s/^VERSION=/version /p;s/^BUILD=/build /p" {UF_LIN}/etc/splunk.version 2>/dev/null '
-            f'| tr "\\n" " "; echo; '
-            f'[ -e {UF_LIN}/ftr ] && echo "first start pending (license not accepted yet / UF never started)"; '
-            f'if pgrep -x splunkd >/dev/null 2>&1; then echo "splunkd is running"; '
-            f'else echo "splunkd is not running"; fi')
-
-
-def spl(cmd, limit=600):
-    return f"timeout {limit} {SPL} {cmd} {SPL_FLAGS} </dev/null 2>&1"
-
-
-@action("linux", "connectivity", "network")
-def l_conn(c):
-    port = int(c.t["port"] or 22)
-    up = port_open(c.t["ip"], port)
-    msg = f"ICMP: {'reply' if ping(c.t['ip']) else 'no reply'}  tcp/{port}: {'open' if up else 'closed'}"
-    if up:
-        try:
-            code, out = c.sudo("id -un")
-            msg += f"  login OK, sudo {'OK' if code == 0 else 'FAILED'} ({out})"
-            up = code == 0
-        except Exception as e:
-            msg += f"  login FAILED: {e}"; up = False
-    return up, msg
-
-
-@action("linux", "uf_check", "uf")
-def l_uf_check(c):
-    _, out = c.sudo(UF_STATE)
-    return True, out
-
-
-@action("linux", "os_detect", "network")
-def l_os_detect(c):
-    d = detect_distro(c)  # defined below, in "Linux distro detection"
-    return True, (f"{d['name']}\n"
-                  f"family: {d['family']} | id: {d['id'] or '?'} | version: {d['version'] or '?'}\n"
-                  f"arch: {d['arch'] or '?'} | kernel: {d['kernel'] or '?'} | init: {d['init'] or '?'}\n"
-                  f"package manager: {d['pm'] or 'none found'} | recommended UF package: "
-                  f"{d['pkg'] or '.tgz'} (.tgz works everywhere)")
-
-
-@action("linux", "uf_install", "uf")
-def l_uf_install(c):
-    f = c.files.get("main", [])
-    if not f:
-        return False, "select a UF package (.deb, .rpm or .tgz)"
-    name = os.path.basename(f[0]).lower()
-    d = detect_distro(c)
-    c.log(f"detected: {d['summary']}")
-    ext = ".deb" if name.endswith(".deb") else ".rpm" if name.endswith(".rpm") else ""
-    if ext and d["pkg"] and ext != d["pkg"]:
-        return False, (f"package type {ext} does not match this distro ({d['name']}); "
-                       f"use a {d['pkg']} package or a .tgz")
-    tmp = f"/tmp/ufpkg_{uuid.uuid4().hex[:6]}_{os.path.basename(f[0])}"
-    arch = d["arch"]
-    if (arch == "x86_64" and re.search(r"arm|aarch64", name)) or \
-       (arch in ("aarch64", "arm64") and re.search(r"x86_64|amd64", name)):
-        return False, f"package architecture does not match host ({arch})"
-    inst = (f"DEBIAN_FRONTEND=noninteractive dpkg --force-confold -i {shlex.quote(tmp)}" if name.endswith(".deb") else
-            f"rpm -Uvh --replacepkgs {shlex.quote(tmp)}" if name.endswith(".rpm") else
-            f"tar -xzf {shlex.quote(tmp)} -C /opt" if name.endswith((".tgz", ".tar.gz")) else None)
-    if not inst:
-        return False, "unsupported package type"
-    pw = c.p.get("splunk_pass") or ""
-    if "\n" in pw or "\r" in pw:
-        return False, "UF admin password must not contain line breaks"
-    c.step("uploading package")
-    sf = c.ssh().open_sftp(); sf.put(f[0], tmp); sf.close()
-    c.step("installing")
-    code, out = c.sudo(f"({inst}) </dev/null; rc=$?; rm -f {shlex.quote(tmp)}; exit $rc")
-    if code:
-        return False, out
-    # Seed the admin user through user-seed.conf (consumed and deleted by splunk on first start) instead of
-    # --seed-passwd, which would show the password in the target's process list. Only on a fresh install:
-    # if etc/passwd exists splunk ignores the seed and would leave the clear-text file behind.
-    seed = f"{UF_LIN}/etc/system/local/user-seed.conf"
-    _, has_users = c.sudo(f"[ -f {UF_LIN}/etc/passwd ] && echo yes || echo no")
-    if has_users.strip() == "yes":
-        if pw:
-            c.log("admin user already exists (upgrade/reinstall) - the supplied password was NOT applied")
-    else:
-        if not pw:
-            pw = secrets.token_urlsafe(12)
-            c.log(f"generated UF admin password (shown once): {pw}")
-        c.step("seeding admin user")
-        code, out = c.put_text(f"[user_info]\nUSERNAME = admin\nPASSWORD = {pw}\n", seed, mode="0600")
-        if code:
-            return False, out
-    c.step("first start (license accepted non-interactively)")
-    code, out = c.sudo(spl("start"))
-    if code:
-        c.sudo(f"rm -f {seed}")
-        return False, out[-1500:]
-    c.step("boot-start")
-    code, out2 = c.sudo("if [ -f /etc/init.d/splunk ] || [ -f /etc/systemd/system/SplunkForwarder.service ]; "
-                        "then echo 'boot-start already enabled'; "
-                        f"else timeout 120 {SPL} enable boot-start </dev/null 2>&1; fi")
-    return code == 0, (out + "\n" + out2)[-1500:]
-
-
-@action("linux", "uf_cfg", "uf")
-def l_uf_cfg(c):
-    fs = c.files.get("cfg", [])
-    if not fs:
-        return False, "select config files"
-    for f in fs:
-        c.step(f"pushing {os.path.basename(f)}")
-        code, out = c.put(f, f"{UF_LIN}/etc/system/local/{os.path.basename(f)}")
-        if code:
-            return False, out
-    if c.p.get("restart"):
-        _, out = c.sudo(spl("restart") + " | tail -3")
-        return True, f"{len(fs)} file(s) pushed; {out}"
-    return True, f"{len(fs)} file(s) pushed"
-
-
-@action("linux", "uf_service", "uf")
-def l_uf_service(c):
-    op = c.p.get("op", "status")
-    if op == "status":
-        _, out = c.sudo(UF_STATE)
-        return "NOT INSTALLED" not in out, out
-    if op not in ("start", "stop", "restart"):  # op ends up in a shell command - whitelist it
-        return False, f"unknown operation: {op}"
-    code, out = c.sudo(f"[ -x {SPL} ] || {{ echo NOT INSTALLED; exit 1; }}; " + spl(op))
-    return code == 0, out[-1500:]
-
-
-PM = "for p in apt-get dnf yum zypper; do command -v $p >/dev/null 2>&1 && echo $p && break; done"
-AUD_INSTALL = {
-    "apt-get": "export DEBIAN_FRONTEND=noninteractive; "
-               "apt-get update -qq; apt-get install -y -o Dpkg::Options::=--force-confold auditd",
-    "dnf": "dnf install -y audit", "yum": "yum install -y audit",
-    "zypper": "zypper --non-interactive install audit"}
-
-
-@action("linux", "auditd_check", "auditd")
-def l_aud_check(c):
-    _, out = c.sudo("if command -v auditctl >/dev/null 2>&1; then echo INSTALLED; "
-                    "systemctl is-active auditd 2>/dev/null || service auditd status 2>&1 | head -1; "
-                    "else echo NOT INSTALLED; fi")
-    return True, out
-
-
-def normalize_rules(c, rules):
-    """Expand /home/*/ per real home dir, drop unwatchable /proc/*/ paths, remove exact duplicates."""
-    _, hs = c.sudo('for h in /home/*/; do [ -d "$h" ] && echo "${h%/}"; done')
-    homes = [h for h in hs.splitlines() if h.startswith("/home/")]
-    out, seen, dropped, expanded = [], set(), [], 0
-    for l in rules:
-        t = l.strip()
-        if not t or t.startswith("#"):
-            out.append(l); continue
-        if "/proc/*/" in t:
-            dropped.append(t); continue
-        if "/home/*/" in t:
-            if not homes:
-                dropped.append(t)
-            for h in homes:
-                n = t.replace("/home/*/", h + "/")
-                if n not in seen:
-                    seen.add(n); out.append(n); expanded += 1
-            continue
-        if t not in seen:
-            seen.add(t); out.append(l)
-    return out, expanded, dropped
-
-
-def apply_rules(c, text):
-    rules, removed = [l.rstrip() for l in text.splitlines()], []
-    rules, expanded, dropped = normalize_rules(c, rules)
-    if expanded or dropped:
-        c.log(f"normalized: {expanded} wildcard rule(s) expanded per user, {len(dropped)} unsupported rule(s) skipped")
-    is_rule = lambda l: bool(l.strip()) and not l.strip().startswith("#")
-    total = sum(1 for l in rules if is_rule(l))
-    norm = lambda s: " ".join(s.split())
-    c.sudo("cp -a /etc/audit/audit.rules /etc/audit/audit.rules.bak-$(date +%s) 2>/dev/null; true")
-    for _ in range(len(rules) + 3):
-        c.job.check()
-        c.put_text("\n".join(rules) + "\n", "/etc/audit/rules.d/99-deployer.rules")
-        code, out = c.sudo("augenrules --load 2>&1")
-        m = re.search(r"error in line (\d+) of (\S+)", out)
-        if code == 0 and not m:
-            ok_n = total - len(removed)
-            return True, (f"SUMMARY: total {total} rules | applied {ok_n} | failed {len(removed)}"
-                          + f" | skipped {len(dropped)} | expanded {expanded}"
-                          + ("\nFailed rules (removed):" + "".join(f"\n  - {r}" for r in removed)
-                             if removed else ""))
-        if not m:
-            return False, out
-        _, bad = c.sudo(f"sed -n '{int(m.group(1))}p' {shlex.quote(m.group(2))}")
-        idx = next((i for i, r in enumerate(rules) if norm(r) == norm(bad)), None)
-        if idx is None or not bad.strip():
-            return False, f"cannot map faulty line {m.group(1)} ({bad!r}):\n{out}"
-        c.log(f"ERROR rule removed: {bad.strip()}")
-        removed.append(bad.strip())
-        rules.pop(idx)
-    return False, "too many retries"
-
-
-PM_PROCS = {"apt-get": "apt|apt-get|aptitude|dpkg|unattended-upgr|packagekitd",
-            "dnf": "dnf|yum|rpm|packagekitd", "yum": "yum|dnf|rpm|packagekitd",
-            "zypper": "zypper|rpm|packagekitd"}
-
-
-def free_pm_lock(c, pm):
-    """Kill processes holding the package-manager lock (opt-in; can interrupt a running upgrade)."""
-    script = (f'PIDS=$(pgrep -x "{PM_PROCS[pm]}" | tr "\\n" " "); '
-              'if [ -z "$PIDS" ]; then echo "no package-manager process running"; exit 0; fi; '
-              'echo "killing:"; ps -o pid,etime,args -p $(echo $PIDS | tr " " ",") 2>&1; '
-              'kill $PIDS 2>/dev/null; sleep 5; kill -9 $PIDS 2>/dev/null; sleep 1; '
-              + ("dpkg --configure -a 2>&1 | tail -3; " if pm == "apt-get" else "") + "exit 0")
-    return c.sudo(script)[1]
-
-
-@action("linux", "auditd_deploy", "auditd")
-def l_aud_deploy(c):
-    rf = c.files.get("cfg", [])
-    _, inst = c.sudo("command -v auditctl >/dev/null 2>&1 && echo yes || echo no")
-    if inst != "yes":
-        if not c.p.get("install", True):
-            return False, "auditd not installed (install option disabled)"
-        _, pm = c.sudo(PM)
-        if pm not in AUD_INSTALL:
-            return False, "no supported package manager found"
-        if c.p.get("kill_lock"):
-            c.step("freeing package-manager lock")
-            c.log(free_pm_lock(c, pm))
-        c.step(f"installing auditd with {pm} (may take a while)")
-        # mktemp, not a fixed /tmp name: root writing to a predictable path can be redirected by a symlink
-        code, out = c.sudo(f'L=$(mktemp); ({AUD_INSTALL[pm]}) </dev/null >"$L" 2>&1; rc=$?; '
-                           'tail -15 "$L"; rm -f "$L"; exit $rc')
-        if code:
-            return False, f"auditd install failed (exit {code}) - check repo/internet access on the target:\n{out}"
-        c.sudo("systemctl enable --now auditd 2>&1 || service auditd start 2>&1")
-        _, chk = c.sudo("command -v auditctl >/dev/null 2>&1 && echo yes || echo no")
-        if chk != "yes":
-            return False, f"package manager reported success but auditctl is missing:\n{out}"
-    if not rf:
-        return True, "auditd present; no rules file supplied"
-    c.step("applying rules")
-    with open(rf[0], encoding="utf-8", errors="ignore") as f:
-        return apply_rules(c, f.read())
-
-
-@action("linux", "auditd_service", "auditd")
-def l_aud_service(c):
-    op = c.p.get("op", "status")
-    cmd = {"restart": "service auditd restart || systemctl restart auditd",
-           "start": "systemctl start auditd || service auditd start",
-           "stop": "service auditd stop || systemctl stop auditd",
-           "status": "systemctl is-active auditd; auditctl -s 2>&1 | head -3"}[op]
-    code, out = c.sudo(cmd + " 2>&1")
-    return (code == 0 or op == "status"), out
-
-
-# ───────────────────────── Linux distro detection ─────────────────────────
-FAMILIES = {"debian": ("debian", "ubuntu", "linuxmint", "kali", "raspbian", "pop"),
-            "rhel": ("rhel", "centos", "rocky", "almalinux", "fedora", "ol", "amzn", "scientific"),
-            "suse": ("suse", "sles", "sled", "opensuse", "opensuse-leap", "opensuse-tumbleweed")}
-
-
-def detect_distro(c):
-    _, out = c.sudo(
-        '. /etc/os-release 2>/dev/null; echo "ID=$ID"; echo "LIKE=$ID_LIKE"; echo "VER=$VERSION_ID"; '
-        'echo "NAME=$PRETTY_NAME"; echo "ARCH=$(uname -m)"; echo "KERNEL=$(uname -r)"; '
-        'echo "INIT=$(ps -p 1 -o comm= 2>/dev/null)"; '
-        'for p in apt-get dnf yum zypper; do command -v $p >/dev/null 2>&1 && echo "PM=$p" && break; done; '
-        '[ -f /etc/redhat-release ] && echo "RH=$(cat /etc/redhat-release)"')
-    kv = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
-    ids = [kv.get("ID", "").lower()] + kv.get("LIKE", "").lower().split()
-    fam = next((f for f, names in FAMILIES.items() if any(i in names for i in ids if i)), "")
-    if not fam and kv.get("PM"):
-        fam = {"apt-get": "debian", "dnf": "rhel", "yum": "rhel", "zypper": "suse"}.get(kv["PM"], "")
-    pkg = {"debian": ".deb", "rhel": ".rpm", "suse": ".rpm"}.get(fam, "")
-    name = kv.get("NAME") or kv.get("RH") or kv.get("ID") or "unknown"
-    d = {"name": name, "id": kv.get("ID", ""), "version": kv.get("VER", ""), "family": fam or "unknown",
-         "arch": kv.get("ARCH", ""), "kernel": kv.get("KERNEL", ""), "init": kv.get("INIT", ""),
-         "pm": kv.get("PM", ""), "pkg": pkg}
-    d["summary"] = (f"{name} | family={d['family']} | arch={d['arch']} | kernel={d['kernel']} | "
-                    f"init={d['init'] or '?'} | pkg manager={d['pm'] or '?'} | "
-                    f"recommended package: {pkg or '.tgz'}")
-    return d
-
-
-@action("linux", "distro", "system")
-def l_distro(c):
-    d = detect_distro(c)
-    return d["family"] != "unknown", d["summary"]
-
-
-# ───────────────────────── UF apps / add-ons ─────────────────────────
-ARCH = (".zip", ".spl", ".tgz", ".tar.gz")
-
-
-@action("windows", "uf_apps", "uf")
-def w_uf_apps(c):
-    fs = c.files.get("main", [])
-    if not fs:
-        return False, "select at least one file / add-on package"
-    apps = UF_WIN + r"\etc\apps"
-    _, out = c.ps(f"if(Test-Path -LiteralPath '{q(apps)}'){{'yes'}}else{{'no'}}")
-    if out.strip() != "yes":
-        return False, "UF apps directory not found (is UF installed?)"
-    for f in fs:
-        name = os.path.basename(f)
-        if c.p.get("extract", True) and name.lower().endswith(ARCH):
-            c.step(f"uploading and extracting {name}")
-            c.smb_cp(f, r"Windows\Temp\ufdeploy" + "\\" + name)
-            tmp = TMP_WIN + "\\" + name
-            if name.lower().endswith(".zip"):
-                ex = f"Expand-Archive -LiteralPath '{q(tmp)}' -DestinationPath '{q(apps)}' -Force"
-            else:
-                ex = f"& tar.exe -xzf '{q(tmp)}' -C '{q(apps)}'; if($LASTEXITCODE -ne 0){{ exit 1 }}"
-            code, out = c.ps(ex + f"; Remove-Item -LiteralPath '{q(tmp)}' -Force -EA SilentlyContinue")
-            if code:
-                return False, f"extract failed for {name}: {out}"
-        else:
-            c.step(f"copying {name}")
-            c.smb_cp(f, UF_WIN[3:] + r"\etc\apps" + "\\" + name)
-    msg = f"{len(fs)} item(s) deployed to {apps}"
-    if c.p.get("restart"):
-        _, out = c.ps("Restart-Service SplunkForwarder; (Get-Service SplunkForwarder).Status")
-        msg += f"; service {out}"
-    return True, msg
-
-
-@action("linux", "uf_apps", "uf")
-def l_uf_apps(c):
-    fs = c.files.get("main", [])
-    if not fs:
-        return False, "select at least one file / add-on package"
-    apps = f"{UF_LIN}/etc/apps"
-    _, out = c.sudo(f"[ -d {apps} ] && echo yes || echo no")
-    if out.strip() != "yes":
-        return False, "UF apps directory not found (is UF installed?)"
-    for f in fs:
-        name = os.path.basename(f)
-        low = name.lower()
-        if c.p.get("extract", True) and low.endswith(ARCH):
-            c.step(f"uploading and extracting {name}")
-            tmp = f"/tmp/.ufd_{uuid.uuid4().hex[:8]}_{name}"
-            sf = c.ssh().open_sftp()
-            try:
-                sf.put(f, tmp)
-            finally:
-                sf.close()
-            if low.endswith(".zip"):
-                ex = (f"(command -v unzip >/dev/null 2>&1 && unzip -oq {shlex.quote(tmp)} -d {apps} || "
-                      f"python3 -c 'import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "
-                      f"{shlex.quote(tmp)} {apps})")
-            else:
-                ex = f"tar -xzf {shlex.quote(tmp)} -C {apps}"
-            code, out = c.sudo(f"{ex}; rc=$?; rm -f {shlex.quote(tmp)}; exit $rc")
-            if code:
-                return False, f"extract failed for {name}: {out}"
-        else:
-            c.step(f"copying {name}")
-            code, out = c.put(f, f"{apps}/{name}")
-            if code:
-                return False, out
-    c.sudo(f"chown -R --reference={apps} {apps} 2>/dev/null; true")
-    msg = f"{len(fs)} item(s) deployed to {apps}"
-    if c.p.get("restart"):
-        _, out = c.sudo(spl("restart") + " | tail -2")
-        msg += f"; {out}"
-    return True, msg
-
-
-# ───────────────────────── Cisco IOS / IOS-XE syslog ─────────────────────────
-SAFE = re.compile(r"^[A-Za-z0-9_.:/+-]+$")
-# IOS accepts abbreviations and "do <exec cmd>", so a blocklist is easy to get around; extra lines must
-# instead start with one of these logging-related keywords (written out in full).
-EXTRA_OK = re.compile(r"^(no\s+)?(logging|service\s+(timestamps|sequence-numbers)|login\s+on-(success|failure)|"
-                      r"archive|log\s+config|notify\s+syslog|hidekeys|ntp\s+server|"
-                      r"clock\s+(timezone|summer-time))(\s|$)|^exit$", re.I)
-LEVELS = ["emergencies", "alerts", "critical", "errors", "warnings", "notifications", "informational", "debugging"]
-
-
-def build_cisco_cmds(p):
-    host = (p.get("syslog_ip") or "").strip()
-    if not SAFE.match(host):
-        raise ValueError("invalid syslog server address")
-    proto = (p.get("syslog_proto") or "udp").lower()
-    port = str(p.get("syslog_port") or "514").strip()
-    level = p.get("level") or "informational"
-    if proto not in ("udp", "tcp"):
-        raise ValueError("syslog protocol must be udp or tcp")
-    if not port.isdigit() or not 1 <= int(port) <= 65535:
-        raise ValueError("invalid syslog port")
-    if level not in LEVELS:
-        raise ValueError("invalid log level")
-    cmds = ["service timestamps log datetime msec localtime show-timezone", "logging on"]
-    cmds.append(f"logging host {host}" if (proto, port) == ("udp", "514")
-                else f"logging host {host} transport {proto} port {port}")
-    cmds.append(f"logging trap {level}")
-    for key, fmt in (("facility", "logging facility {}"), ("source_if", "logging source-interface {}")):
-        v = (p.get(key) or "").strip()
-        if v:
-            if not SAFE.match(v):
-                raise ValueError(f"invalid value for {key}")
-            cmds.append(fmt.format(v))
-    if p.get("origin_id"):
-        cmds.append("logging origin-id hostname")
-    if p.get("userinfo"):
-        cmds.append("logging userinfo")
-    if p.get("config_log"):
-        cmds += ["archive", "log config", "logging enable", "notify syslog contenttype plaintext", "hidekeys",
-                 "exit", "exit"]
-    if p.get("login_log"):
-        cmds += ["login on-success log", "login on-failure log"]
-    if p.get("aaa_cmd"):
-        g = (p.get("aaa_group") or "tacacs+").strip()
-        if not SAFE.match(g):
-            raise ValueError("invalid AAA group name")
-        cmds += [f"aaa accounting commands 1 default start-stop group {g}",
-                 f"aaa accounting commands 15 default start-stop group {g}"]
-    for line in (p.get("extra") or "").splitlines():
+        if "/" in spec:
+            n = ipaddress.ip_network(spec, strict=False)
+            if n.num_addresses > MAX_HOSTS: raise OverflowError
+            return [str(h) for h in n.hosts()]
+        if "-" in spec and spec.count(".") >= 6:
+            a, b = sorted(int(ipaddress.ip_address(x.strip())) for x in spec.split("-", 1))
+            if b - a >= MAX_HOSTS: raise OverflowError
+            return [str(ipaddress.ip_address(i)) for i in range(a, b + 1)]
+    except ValueError: pass
+    except OverflowError: raise Exception(f"{spec}: too many addresses (max {MAX_HOSTS} per run)")
+    return [spec]
+
+def parse_targets(text, user, pw, default_os, profiles):
+    prof = {}
+    for l in profiles.splitlines():
+        p = l.split(",", 2)
+        if len(p) == 3: prof[p[0].strip()] = (p[1].strip(), p[2])
+    out, seen = [], set()
+    for line in text.splitlines():
         line = line.strip()
-        if not line or line.startswith("!"):
-            continue
-        if not EXTRA_OK.match(line):
-            raise ValueError(f"command not allowed (only logging / timestamps / archive log config / login / "
-                             f"ntp / clock commands, keywords in full): {line}")
-        cmds.append(line)
-    return cmds
+        if not line or line.startswith("#"): continue
+        o, u, w = default_os, user, pw
+        m = re.match(r"(win|lin)\w*:(.*)", line, re.I)
+        if m: o = "windows" if m[1].lower() == "win" else "linux"; line = m[2].strip()
+        if " @" in line:
+            line, pn = line.rsplit(" @", 1)
+            if pn.strip() not in prof: raise Exception(f"Unknown credential profile: @{pn.strip()}")
+            u, w = prof[pn.strip()]
+        elif line.count(",") >= 2:
+            line, u, w = line.split(",", 2); line, u = line.strip(), u.strip()
+        for h in expand(line):
+            if h and h not in seen: seen.add(h); out.append((h, u, w, o))  # duplicates would make the job never finish
+        if len(out) > MAX_HOSTS: raise Exception(f"Too many targets (max {MAX_HOSTS} per run)")
+    return out
 
-
-def cisco_net(c):
-    if not c._net:
-        from netmiko import ConnectHandler
-        tel = c.p.get("conn") == "telnet"
-        port = int(c.t["port"] or (23 if tel else 22))
-        kw = {}
-        if tel:
-            c.log("WARNING: telnet sends the username and passwords in clear text")
-        else:
-            ssh_precheck(c.t["ip"], port, c.log)  # host key verified/saved before credentials are sent
-            kw = dict(ssh_strict=True, system_host_keys=False, alt_host_keys=True, alt_key_file=KNOWN_HOSTS)
-        c._net = ConnectHandler(device_type="cisco_ios_telnet" if tel else "cisco_ios", host=c.t["ip"],
-                                port=port, username=c.t["user"],
-                                password=c.t["pass"], secret=c.t.get("enable") or c.t["pass"],
-                                timeout=30, conn_timeout=20, **kw)
-        if not c._net.check_enable_mode():
-            c._net.enable()
-    return c._net
-
-
-@action("cisco", "connectivity", "cisco")
-def cs_conn(c):
-    port = int(c.t["port"] or 22)
-    if not port_open(c.t["ip"], port):
-        return False, f"ICMP: {'reply' if ping(c.t['ip']) else 'no reply'}  tcp/{port}: closed"
-    n = cisco_net(c)
-    return True, f"tcp/{port} open, login OK, prompt {n.find_prompt()}\n{n.send_command('show clock')}"
-
-
-@action("cisco", "preview", "cisco")
-def cs_preview(c):
-    cmds = build_cisco_cmds(c.p)
-    return True, "configure terminal\n" + "\n".join("  " + x for x in cmds) + "\nend"
-
-
-@action("cisco", "apply", "cisco")
-def cs_apply(c):
-    cmds = build_cisco_cmds(c.p)
-    n = cisco_net(c)
-    n.config_mode()
-    errs = 0
-    for cmd in cmds:
-        c.job.check()
-        out = n.send_command_timing(cmd, strip_prompt=False, strip_command=True, last_read=0.6, read_timeout=30)
-        c.log(f"> {cmd}")
-        bad = [l for l in out.splitlines() if l.strip().startswith("%")]
-        if bad:
-            errs += 1
-            c.job.log(c.t["ip"], "FAIL", "  " + " / ".join(b.strip() for b in bad))
-    n.exit_config_mode()
-    msg = f"{len(cmds)} commands sent, {errs} error(s)"
-    if c.p.get("save"):
-        out = n.send_command_timing("write memory", read_timeout=60)
-        if "confirm" in out.lower() or out.rstrip().endswith("?"):  # some images ask before overwriting NVRAM
-            out += n.send_command_timing("\n", read_timeout=60)
-        if "[OK]" in out or "Building configuration" in out:
-            msg += "; configuration saved"
-        else:
-            c.job.log(c.t["ip"], "FAIL", "write memory: " + out.strip())
-            msg += "; SAVE NOT CONFIRMED"
-            errs += 1
-    return errs == 0, msg
-
-
-@action("cisco", "verify", "cisco")
-def cs_verify(c):
-    n = cisco_net(c)
-    parts = []
-    for cmd in ("show running-config | include ^logging|^archive|log config|^login on|^aaa accounting",
-                "show logging | include Trap|Logging to|logging to"):
-        parts.append(f"# {cmd}\n" + n.send_command(cmd))
-    return True, "\n".join(parts)
-
-
-# ───────────────────────── API ─────────────────────────
-@app.post("/api/run")
-async def run(os_name: str = Form(..., alias="os"), action_name: str = Form(..., alias="action"),
-              params: str = Form("{}"), mode: str = Form("single"), targets: str = Form(""),
-              port: str = Form(""), username: str = Form(""), password: str = Form(""),
-              auth: str = Form("ntlm"), key: str = Form(""), sudo_pass: str = Form(""), enable: str = Form(""), cred: str = Form(""),
-              winrm_verify: str = Form(""),
-              csv_file: Optional[UploadFile] = File(None),
-              main: List[UploadFile] = File(default=[]), cfg: List[UploadFile] = File(default=[])):
-    if (os_name, action_name) not in ACTIONS:
-        raise HTTPException(400, "unknown action")
-    if cred:
-        v = vault_get(cred)
-        username = v.get("username") or username
-        password = v.get("password") or password
-        enable = v.get("enable") or enable
-        key = v.get("key") or key
-        sudo_pass = v.get("sudo_pass") or sudo_pass
-    job = Job()
-    try:
-        csv_bytes = await csv_file.read() if csv_file and csv_file.filename else b""
-        tl = parse_targets(mode, targets, csv_bytes, dict(port=port, user=username, **{"pass": password},
-                                                         auth=auth, key=key, sudo_pass=sudo_pass, enable=enable,
-                                                         verify=bool(winrm_verify)))
-    except Exception as e:
-        raise HTTPException(400, str(e))
-    files = {}
-    for grp, ups in (("main", main), ("cfg", cfg)):
-        for u in ups:
-            if u.filename:
-                p = os.path.join(job.dir, grp + "_" + os.path.basename(u.filename))
-                with open(p, "wb") as f:
-                    shutil.copyfileobj(u.file, f)
-                files.setdefault(grp, []).append(p)
-                # keep the original name for remote files
-                final = os.path.join(job.dir, grp, os.path.basename(u.filename))
-                os.makedirs(os.path.dirname(final), exist_ok=True)
-                shutil.move(p, final)
-                files[grp][-1] = final
-    JOBS[job.id] = job
-    fn, svc = ACTIONS[(os_name, action_name)]
-    p = json.loads(params or "{}")
-    op = action_name + (":" + p["op"] if p.get("op") else "")
-
-    def one(t):
-        c = Ctx(job, t, p, files, os_name)
+def tool_url(base, host):
+    """Base URL a Windows target downloads library files from. A loopback address (UI opened as localhost)
+    is useless to the target, so it is replaced by this machine's IP on the route towards that target."""
+    base = (base or "").strip().rstrip("/")
+    if "://" not in base: base = "http://" + base
+    p = urlsplit(base); hn = p.hostname or ""
+    if hn in ("localhost", "::1") or hn.startswith("127."):
         try:
-            job.check()
-            ok, msg = fn(c)
-        except Cancelled:
-            ok, msg = False, "cancelled"
-        except Exception as e:
-            ok, msg = False, f"{type(e).__name__}: {e}"
-        finally:
-            c.close()
-        job.log(t["ip"], "OK" if ok else "FAIL", msg)
-        db_add(t["ip"], os_name, svc, op, ok, msg, OPERATOR)
+            with closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as s: s.connect((host, 9)); ip = s.getsockname()[0]
+            p = p._replace(netloc=ip + (f":{p.port}" if p.port else ""))
+        except OSError: pass
+    return urlunsplit(p) + "/files/"
 
-    def runner():
-        with ThreadPoolExecutor(WORKERS) as ex:
-            list(ex.map(one, tl))
-        job.done = True
-        shutil.rmtree(job.dir, ignore_errors=True)
-
-    threading.Thread(target=runner, daemon=True).start()
-    return {"job": job.id, "hosts": len(tl)}
-
-
-@app.get("/api/jobs/{jid}/stream")
-def stream(jid: str):
-    job = JOBS.get(jid)
-    if not job:
-        raise HTTPException(404)
-
-    def gen():
-        i = 0
-        while True:
-            while i < len(job.lines):
-                yield f"data: {json.dumps(job.lines[i])}\n\n"; i += 1
-            if job.done and i >= len(job.lines):
-                yield "event: end\ndata: {}\n\n"; return
-            time.sleep(0.25)
-    return StreamingResponse(gen(), media_type="text/event-stream")
-
-
-@app.post("/api/jobs/{jid}/cancel")
-def cancel(jid: str):
-    if jid in JOBS:
-        JOBS[jid].cancel.set()
-    return {"ok": True}
-
-
-# ───────────────────────── credential vault (encrypted) ─────────────────────────
-VAULT = os.path.join(DATA, "vault.json")
-TPL = os.path.join(DATA, "templates.json")
-_vk = {"f": None}
-
-
-def _jload(path, default):
+# ---------- Windows: WinRM first, SMB + scheduled task as fallback ----------
+def smb_ps(host, u, pw, script):
+    if os.name != "nt": raise Exception("SMB fallback needs the tool to run on Windows")
+    unc = f"\\\\{host}\\C$"; tid = uuid.uuid4().hex[:8]; tn = "ufd_" + tid
+    loc = f"C:\\Windows\\Temp\\{tn}"; rem = f"{unc}\\Windows\\Temp\\{tn}"
+    run = lambda c: subprocess.run(c, capture_output=True, text=True, timeout=120)
+    r = run(["net", "use", unc, pw, f"/user:{u}"])
+    if r.returncode: raise Exception("SMB connect failed: " + (r.stderr or r.stdout).strip()[:200])
     try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
+        with open(rem + ".ps1", "w", encoding="utf-8-sig") as fh: fh.write(script)
+        tr = f'cmd /c powershell -NoProfile -ExecutionPolicy Bypass -File {loc}.ps1 > {loc}.out 2>&1 & echo x > {loc}.done'
+        r = run(["schtasks", "/create", "/s", host, "/u", u, "/p", pw, "/tn", tn, "/tr", tr, "/sc", "once", "/st", "00:00", "/ru", "SYSTEM", "/f"])
+        if r.returncode: raise Exception("schtasks create failed: " + (r.stderr or r.stdout).strip()[:200])
+        r = run(["schtasks", "/run", "/s", host, "/u", u, "/p", pw, "/tn", tn])
+        if r.returncode: raise Exception("schtasks run failed: " + (r.stderr or r.stdout).strip()[:200])
+        for _ in range(450):
+            if os.path.exists(rem + ".done"): break
+            time.sleep(2)
+        else: return "ERROR: timed out waiting for remote script"
+        with open(rem + ".out", encoding="utf-8", errors="ignore") as fh: return fh.read().strip()
+    finally:
+        run(["schtasks", "/delete", "/s", host, "/u", u, "/p", pw, "/tn", tn, "/f"])
+        for e in (".ps1", ".out", ".done"):
+            try: os.remove(rem + e)
+            except OSError: pass
+        run(["net", "use", unc, "/delete", "/y"])
 
+def clean(r): return re.sub(r"<Objs.*?</Objs>", "", re.sub(r"#< CLIXML", "", r), flags=re.S).strip()
+def psq(s): return "'" + str(s).replace("'", "''") + "'"   # PowerShell literal string
 
-def _jsave(path, obj):
-    tmp = path + ".tmp"  # write then rename, so a crash mid-write can't leave a truncated file
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, path)
+def lockfix(kill):
+    n = '"apt|apt-get|dpkg|unattended-upgr|yum|dnf|rpm|zypper|packagekitd"'
+    s = f'for i in $(seq 1 15); do pgrep -x {n} >/dev/null || break; sleep 2; done; '
+    if kill: s += (f'if pgrep -x {n} >/dev/null; then echo "Package manager busy - killing holders"; pkill -9 -x {n}; sleep 2; '
+                   'rm -f /var/lib/dpkg/lock* /var/lib/apt/lists/lock /var/cache/apt/archives/lock /var/run/yum.pid; command -v dpkg >/dev/null && dpkg --configure -a; fi; ')
+    return s
 
+def win(host, u, pw, a):
+    base = tool_url(a.get("base"), host); method = a.get("method", "auto"); note = []
+    url = lambda n: psq(base + urlq(n))
+    def ps(c):
+        # Stop on the first cmdlet error and report it as one ERROR line instead of a red CLIXML dump
+        c = "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='Stop';try{" + c + "}catch{'ERROR: '+$_.Exception.Message}"
+        return clean(ps0(c))
+    def ps0(c):
+        if method in ("auto", "winrm"):
+            try:
+                s = winrm.Session(host, auth=(u, pw), transport="ntlm", read_timeout_sec=900, operation_timeout_sec=800)
+                r = s.run_ps(c); return (r.std_out + r.std_err).decode(errors="ignore").strip()
+            except Exception as e:
+                if method == "winrm" or not re.search(r"refused|timed out|Max retries|Connection|unreachable", str(e), re.I): raise
+                note.append("(WinRM unavailable -> used SMB + scheduled task)")
+        return smb_ps(host, u, pw, c)
+    act, f, f2 = a["action"], a.get("file", ""), a.get("file2", "")
+    need_uf = f'if(!(Test-Path {psq(WUF)})){{"ERROR: Splunk UF is not installed";return}};'
+    if act == "check":
+        r = ps('$u=Get-Service SplunkForwarder -EA 0;$s=Get-Service Sysmon64,Sysmon -EA 0|select -f 1;'
+               '"Splunk UF: "+$(if($u){$u.Status}else{"NOT INSTALLED"});"Sysmon: "+$(if($s){$s.Name+" "+$s.Status}else{"NOT INSTALLED"})')
+    elif act == "install_uf":
+        msi = ' AGREETOLICENSE=Yes SPLUNKUSERNAME=admin SPLUNKPASSWORD="' + a["apass"].replace('"', '""') + '" LAUNCHSPLUNK=1 /quiet /norestart'
+        if a.get("idx"): msi += f' RECEIVING_INDEXER="{a["idx"]}"'
+        conf = (f';$c=Join-Path {psq(WLOCAL)} {psq(f2)};Invoke-WebRequest {url(f2)} -OutFile $c -UseBasicParsing;'
+                f'Restart-Service SplunkForwarder -Force;"Initial conf applied: "+$c') if f2 else ""
+        r = ps('if(Get-Service SplunkForwarder -EA 0){"UF already installed - skipped";return}'
+               f'$m="$env:TEMP\\ufd_uf.msi";Invoke-WebRequest {url(f)} -OutFile $m -UseBasicParsing;'
+               f'$p=Start-Process msiexec -Wait -PassThru -ArgumentList (\'/i "\'+$m+\'"\'+{psq(msi)});Remove-Item $m -EA 0;'
+               'if($p.ExitCode -notin 0,3010){"ERROR: msiexec exit code "+$p.ExitCode+" (1603 = install failed, 1618 = another install is running)";return}'
+               '"msiexec exit code: "+$p.ExitCode' + conf)
+    elif act == "sysmon":
+        inst = (f'else{{Invoke-WebRequest {url(f2)} -OutFile "$d\\sysmon.exe" -UseBasicParsing;$x="$d\\sysmon.exe";$g="-accepteula","-i";$t="INSTALLED"}}' if f2
+                else 'else{"ERROR: Sysmon is not installed and no Sysmon.exe was selected";return}')
+        r = ps(f'$d="$env:TEMP\\ufd_sm";mkdir $d -Force|Out-Null;Invoke-WebRequest {url(f)} -OutFile "$d\\cfg.xml" -UseBasicParsing;'
+               '$sv=Get-Service Sysmon64,Sysmon -EA 0|select -f 1;'
+               'if($sv){$x=if($sv.Name -eq "Sysmon64"){"$env:windir\\Sysmon64.exe"}else{"$env:windir\\Sysmon.exe"};$g=,"-c";$t="config UPDATED"}' + inst +
+               ';$ErrorActionPreference="Continue";$o=& $x @g "$d\\cfg.xml" 2>&1|Out-String;$e=$LASTEXITCODE;Remove-Item $d -Recurse -Force -EA 0;'
+               '$o.Trim();if($e){"ERROR: sysmon exit code "+$e}else{"Sysmon "+$t}')
+    elif act == "push_conf":
+        r = ps(need_uf + f'mkdir {psq(WLOCAL)} -Force|Out-Null;$o=Join-Path {psq(WLOCAL)} {psq(f)};Invoke-WebRequest {url(f)} -OutFile $o -UseBasicParsing;'
+               '"Copied to $o";"Restart the SplunkForwarder service to apply it"')
+    elif act == "detect":
+        r = ps('$o=Get-CimInstance Win32_OperatingSystem;$c=Get-CimInstance Win32_ComputerSystem;"OS: "+$o.Caption+" build "+$o.BuildNumber+" ("+$o.OSArchitecture+")";'
+               '"Host: "+$env:COMPUTERNAME+"  Domain/Workgroup: "+$c.Domain;"PowerShell: "+$PSVersionTable.PSVersion;"Last boot: "+$o.LastBootUpTime')
+    elif act == "deploy_app":
+        r = ps(need_uf + f'$d={psq(WAPPS)};$z=Join-Path $env:TEMP {psq("ufd_" + f)};Invoke-WebRequest {url(f)} -OutFile $z -UseBasicParsing;'
+               'if($z -like "*.zip"){Expand-Archive $z $d -Force}else{$ErrorActionPreference="Continue";$o=tar -xf $z -C $d 2>&1|Out-String;'
+               'if($LASTEXITCODE){Remove-Item $z -EA 0;"ERROR: tar exit code "+$LASTEXITCODE+" "+$o.Trim();return}};Remove-Item $z -EA 0;'
+               '"Extracted into $d";"Apps: "+((Get-ChildItem $d -Directory).Name -join ", ");"Restart the SplunkForwarder service to load it"')
+    elif act == "svc":
+        v = {"start": "Start-Service $n", "stop": "Stop-Service $n -Force", "restart": "Restart-Service $n -Force", "status": "$null"}[a["op"]]
+        r = ps(f'$n=if({psq(a["svc"])} -eq "sysmon"){{(Get-Service Sysmon64,Sysmon -EA 0|select -f 1).Name}}else{{"SplunkForwarder"}};'
+               f'if(!$n -or !(Get-Service $n -EA 0)){{"Service not installed";return}}; {v}; "$n : "+(Get-Service $n).Status')
+    else: r = "ERROR: unknown action"
+    return "\n".join([r] + note)
 
-def _vload():
-    """Vault file or None if it doesn't exist. A file that exists but can't be read is an error, never
-    'no vault' - otherwise the next unlock would create a new empty vault over the old credentials."""
-    if not os.path.exists(VAULT):
-        return None
+# ---------- Linux (SSH, non-root sudo user) ----------
+def lin(host, u, pw, a):
+    c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    a["_job"]["clients"].append(c)
+    c.connect(host, username=u, password=pw, timeout=20, look_for_keys=False, allow_agent=False)
+    sudo = "" if u == "root" else "sudo -S -p '' "
+    def sh(cmd, t=300):
+        # password goes through stdin (not the command line, where `ps` would show it); stderr merged in order
+        ch = c.get_transport().open_session(); ch.settimeout(t); ch.set_combine_stderr(True)
+        ch.exec_command(sudo + "bash -c " + shlex.quote("exec </dev/null; " + cmd))
+        ch.sendall((pw + "\n").encode()); ch.shutdown_write(); b = b""
+        while d := ch.recv(65536): b += d
+        rc, o = ch.recv_exit_status(), b.decode(errors="ignore").strip(); ch.close()
+        if sudo and rc and re.search(r"incorrect password|not in the sudoers|not allowed to execute|password is required|must have a tty", o, re.I):
+            raise Exception("sudo failed: " + o[-300:])
+        return rc, o
+    res = lambda r: r[1] if r[0] == 0 else "ERROR: command failed (exit code %d)\n%s" % r
+    def put(name, data=None):
+        dst = f"/tmp/ufd_{uuid.uuid4().hex[:8]}_" + re.sub(r"[^\w.-]", "_", name)
+        with closing(c.open_sftp()) as sf:
+            if data is None: sf.put(os.path.join(DATA, name), dst)
+            else:
+                with sf.open(dst, "w") as fh: fh.write(data)
+        return dst
+    act, f = a["action"], a.get("file", ""); S = f"{LUF}/bin/splunk"; q = shlex.quote
     try:
-        with open(VAULT, encoding="utf-8") as f:
-            v = json.load(f)
-        v["salt"], v["check"], v["items"]
-        return v
-    except Exception:
-        raise HTTPException(500, f"vault file is unreadable ({VAULT}); restore it from a backup or move it away")
+        if act == "check":
+            return sh(f'. /etc/os-release; echo "OS: $PRETTY_NAME";'
+                      f'if [ -x {S} ]; then echo "Splunk UF: installed ($(grep -h ^VERSION {LUF}/etc/splunk.version 2>/dev/null))";'
+                      f'[ -f {LUF}/etc/passwd ] && echo "Initialized: yes (admin user exists)" || echo "Initialized: NO - first start / admin user not done (run Install UF to finish)";'
+                      f'echo "Service: $({S} status 2>&1 </dev/null| head -1)"; else echo "Splunk UF: NOT INSTALLED"; fi;'
+                      f'if command -v auditctl >/dev/null; then echo "auditd: installed, $(systemctl is-active auditd 2>&1)"; else echo "auditd: NOT INSTALLED"; fi')[1]
+        if act == "install_uf":
+            p = q(put(f)); fl = f.lower(); LK = lockfix(a.get("kill"))
+            i = f"{LK} rpm -U {p}" if fl.endswith(".rpm") else f"{LK} dpkg -i {p}" if fl.endswith(".deb") else f"tar xzf {p} -C /opt"
+            cp = q(put(a["file2"])) if a.get("file2") else ""
+            conf = f'install -m 644 {cp} {LUF}/etc/system/local/{q(a["file2"])}; rm -f {cp};' if cp else ""
+            SD = '$( [ -d /run/systemd/system ] && echo "-systemd-managed 1" )'
+            return res(sh(f'if [ -x {S} ]; then echo "UF binaries already present - finishing setup/start"; else {i} || {{ echo "ERROR: package install FAILED"; rm -f {p}; exit 1; }}; fi; rm -f {p};'
+                      f'mkdir -p {LUF}/etc/system/local;' + conf +
+                      f'[ -f {LUF}/etc/passwd ] || {{ printf "[user_info]\\nUSERNAME = admin\\nPASSWORD = %s\\n" {q(a["apass"])} > {LUF}/etc/system/local/user-seed.conf; echo "admin user seeded"; }};'
+                      # first start initializes as root; then hand the tree to the package's service user (splunkfwd) and enable boot-start for it
+                      f'OWN=$(stat -c %U {LUF}); id "$OWN" >/dev/null 2>&1 || OWN=root;'
+                      f'timeout 240 {S} start --accept-license --answer-yes --no-prompt 2>&1 | tail -5;'
+                      f'timeout 120 {S} stop >/dev/null 2>&1; chown -R "$OWN": {LUF};'
+                      f'timeout 120 {S} enable boot-start {SD} -user "$OWN" --accept-license --answer-yes --no-prompt 2>&1 | tail -2;'
+                      f'timeout 240 {S} start --accept-license --answer-yes --no-prompt 2>&1 | tail -3;'
+                      + (f'{S} add forward-server {q(a["idx"])} -auth admin:{q(a["apass"])} 2>&1 | tail -2;' if a.get("idx") else "")
+                      + f'echo "Service: $({S} status 2>&1 | head -1)"', 900))
+        if act == "auditd":
+            rc, o = sh('command -v auditctl >/dev/null && { echo "auditd already installed"; exit 0; }; ' + lockfix(a.get("kill")) +
+                      'if command -v apt-get >/dev/null; then echo "[apt]"; DEBIAN_FRONTEND=noninteractive apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y auditd audispd-plugins || DEBIAN_FRONTEND=noninteractive apt-get install -y auditd;'
+                      'elif command -v dnf >/dev/null; then echo "[dnf]"; dnf install -y audit;elif command -v yum >/dev/null; then echo "[yum]"; yum install -y audit;'
+                      'elif command -v zypper >/dev/null; then zypper -n install audit;elif command -v pacman >/dev/null; then pacman -S --noconfirm audit;'
+                      'elif command -v apk >/dev/null; then apk add audit; else echo "ERROR: no supported package manager"; exit 1; fi;'
+                      'command -v auditctl >/dev/null || { echo "ERROR: auditd install failed"; exit 1; };'
+                      '(systemctl enable --now auditd || service auditd start) 2>&1', 900); return res((rc, o[-1500:]))
+        if act == "audit_rules":
+            with open(os.path.join(DATA, f), encoding="utf-8-sig", errors="ignore") as fh: lines = fh.read().splitlines()
+            log = []; total = sum(1 for l in lines if re.match(r"\s*-(a|A|w)\b", l))
+            wp = lambda l: (re.match(r"\s*-w\s+(\S+)", l) or [None, None])[1]
+            paths = sorted({wp(l) for l in lines if wp(l)})
+            if paths:  # 1) drop watch rules whose path does not exist (fast, avoids hundreds of retries)
+                _, o = sh('for p in ' + " ".join(map(q, paths)) + '; do [ -e "$p" ] || echo "$p"; done'); miss = set(o.splitlines())
+                for l in [l for l in lines if wp(l) in miss]: log.append("Removed (path not on this host): " + l.strip())
+                lines = [l for l in lines if wp(l) not in miss]
+            for _ in range(300):  # 2) load via augenrules; remove whichever rule the kernel rejects, retry
+                p = q(put("splunk.rules", "\n".join(lines) + "\n")); sh(f"mkdir -p /etc/audit/rules.d; install -m 640 {p} /etc/audit/rules.d/splunk.rules; rm -f {p}")
+                rc, o = sh("augenrules --load 2>&1 || auditctl -R /etc/audit/rules.d/splunk.rules 2>&1")
+                if rc == 0 and not re.search(r"error|faulty", o, re.I): log.append("Rules loaded OK"); break
+                m = re.search(r"faulty line \d+ \('(.*?)'\)", o); bad = m[1] if m else None
+                if not bad and (m2 := re.search(r"error in line (\d+) of (\S+)", o)):
+                    bad = sh(f"sed -n {int(m2[1])}p {q(m2[2])}")[1]
+                idx = next((k for k, l in enumerate(lines) if bad and l.strip() == bad.strip()), None)
+                if idx is None: log.append("ERROR: stopped - rejected rule is not in your file: " + (bad or o[-300:])); break
+                log.append(f"Removed (rejected): {lines[idx].strip()}"); del lines[idx]
+            rem = sum(x.startswith("Removed") for x in log); ok = "Rules loaded OK" in log
+            return "\n".join(log) + "\nActive rules: " + sh("auditctl -l | grep -vc '^No rules'")[1] + f"\nSUMMARY rules_total={total} applied={total - rem if ok else 0} removed={rem}"
+        if act == "push_conf":
+            p = q(put(f)); d = f"{LUF}/etc/system/local"
+            return res(sh(f'[ -x {S} ] || {{ echo "ERROR: Splunk UF is not installed"; rm -f {p}; exit 1; }}; mkdir -p {d} && install -m 644 {p} {d}/{q(f)} && rm -f {p} && '
+                          f'chown $(stat -c %U:%G {LUF}) {d}/{q(f)} && echo "Copied to {d}/{f}" && echo "Restart Splunk to apply it"'))
+        if act == "detect":
+            return sh('. /etc/os-release; echo "OS: $PRETTY_NAME"; echo "Kernel: $(uname -sr) $(uname -m)"; echo "Hostname: $(hostname)";'
+                      'echo "Package manager: $(for m in apt-get dnf yum zypper pacman apk; do command -v $m >/dev/null && echo $m; done | tr "\\n" " ")";'
+                      '[ -d /run/systemd/system ] && echo "Init: systemd" || echo "Init: non-systemd"')[1]
+        if act == "deploy_app":
+            p = q(put(f)); A = f"{LUF}/etc/apps"
+            return res(sh(f'[ -x {S} ] || {{ echo "ERROR: Splunk UF is not installed"; rm -f {p}; exit 1; }}; mkdir -p {A}; '
+                          f'case {q(f.lower())} in *.zip) unzip -oq {p} -d {A};; *) tar xzf {p} -C {A};; esac; r=$?; rm -f {p}; [ $r -eq 0 ] || exit $r; '
+                          f'chown -R $(stat -c %U:%G {LUF}) {A} 2>/dev/null; echo "Extracted into {A}"; echo "Apps: $(ls {A} | tr "\\n" " ")"; echo "Restart Splunk to load it"'))
+        if act == "svc":
+            op, sv = a["op"], a["svc"]
+            if sv == "splunk":
+                if op == "status": return sh(f"{S} status 2>&1")[1]
+                return res(sh(f"[ -x {S} ] || {{ echo 'Splunk UF: NOT INSTALLED'; exit 0; }}; timeout 240 {S} {op} --accept-license --answer-yes --no-prompt 2>&1 | tail -5"))
+            n = "auditd" if sv == "auditd" else "sysmon"
+            cmd = (f"systemctl is-active {n}; systemctl status {n} --no-pager 2>&1 | head -6" if op == "status" else
+                   f"(service {n} {op} || systemctl {op} {n}) 2>&1; echo \"{n}: $(systemctl is-active {n})\"")
+            return sh(cmd)[1]
+        return "ERROR: unknown action"
+    finally: c.close()
 
+# ---------- Cisco (SSH or Telnet) ----------
+try: from telnetlib import Telnet   # removed from the standard library in Python 3.13
+except ImportError:
+    class Telnet:
+        """Minimal telnet client (declines every option) - enough for a Cisco CLI session."""
+        def __init__(s, host, port, timeout): s.k = socket.create_connection((host, port), timeout); s.buf = b""
+        def _fill(s, wait):  # True = got data, False = nothing yet, None = closed
+            s.k.settimeout(wait)
+            try: d = s.k.recv(65536)
+            except OSError: return False
+            if not d: return None
+            i = 0
+            while i < len(d):
+                if d[i] != 255: j = d.find(b"\xff", i); j = len(d) if j < 0 else j; s.buf += d[i:j]; i = j; continue
+                cmd = d[i + 1:i + 2]
+                if cmd in (b"\xfd", b"\xfb"): s.k.sendall(b"\xff" + (b"\xfc" if cmd == b"\xfd" else b"\xfe") + d[i + 2:i + 3]); i += 3
+                elif cmd == b"\xfa": j = d.find(b"\xff\xf0", i); i = len(d) if j < 0 else j + 2
+                elif cmd == b"\xff": s.buf += b"\xff"; i += 2
+                else: i += 3 if cmd in (b"\xfc", b"\xfe") else 2
+            return True
+        def read_until(s, m, timeout):
+            end = time.time() + timeout
+            while m not in s.buf and time.time() < end and s._fill(max(.05, end - time.time())) is not None: pass
+            i = s.buf.find(m); n = i + len(m) if i >= 0 else len(s.buf); r, s.buf = s.buf[:n], s.buf[n:]; return r
+        def read_very_eager(s):
+            while s._fill(0): pass
+            r, s.buf = s.buf, b""; return r
+        def write(s, b): s.k.sendall(b.replace(b"\xff", b"\xff\xff"))
+        def close(s): s.k.close()
 
-def _fernet(pw, salt):
-    from cryptography.fernet import Fernet
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=480000)
-    return Fernet(base64.urlsafe_b64encode(kdf.derive(pw.encode())))
-
-
-def vault_get(name):
-    v = _vload()
-    if not _vk["f"] or not v:
-        raise HTTPException(403, "vault is locked - unlock it first")
-    tok = v["items"].get(name)
-    if not tok:
-        raise HTTPException(404, "credential not found")
-    return json.loads(_vk["f"].decrypt(tok.encode()))
-
-
-@app.get("/api/vault")
-def vault_status():
-    v = _vload()
-    return {"exists": bool(v), "unlocked": _vk["f"] is not None,
-            "names": sorted(v["items"]) if v and _vk["f"] else []}
-
-
-@app.post("/api/vault/unlock")
-def vault_unlock(body: dict = Body(...)):
-    pw, v = body.get("password", ""), _vload()
-    if not v:
-        if len(pw) < 8:
-            raise HTTPException(400, "master password must be at least 8 characters")
-        salt = os.urandom(16)
-        f = _fernet(pw, salt)
-        v = {"salt": base64.b64encode(salt).decode(), "check": f.encrypt(b"ok").decode(), "items": {}}
-        _jsave(VAULT, v)
+def cisco(host, u, pw, a):
+    proto = a.get("cproto", "ssh"); port = int(a.get("cport") or (23 if proto == "telnet" else 22)); en = a.get("cenable", "")
+    socket.create_connection((host, port), 6).close()  # connectivity test
+    if a["action"] == "c_test": cmds = ["show clock", "show logging | include Logging to|Trap logging"]
     else:
-        f = _fernet(pw, base64.b64decode(v["salt"]))
+        if not a.get("syslog"): raise Exception("Syslog server IP is required")
+        body = [l.replace("{syslog_ip}", a["syslog"]).rstrip() for l in a.get("ctext", "").splitlines() if l.strip()]
+        cmds = ["configure terminal"] + body + ["end", "write memory"]
+    out = ""
+    if proto == "telnet":
+        t = Telnet(host, port, 10)
         try:
-            f.decrypt(v["check"].encode())
-        except Exception:
-            raise HTTPException(403, "wrong master password")
-    _vk["f"] = f
-    return {"ok": True}
+            t.read_until(b"sername:", 10); t.write(u.encode() + b"\n"); t.read_until(b"assword:", 10); t.write(pw.encode() + b"\n")
+            time.sleep(1); out += t.read_very_eager().decode(errors="ignore")
+            if en: t.write(b"enable\n"); time.sleep(.5); t.write(en.encode() + b"\n")
+            for x in ["terminal length 0"] + cmds: t.write(x.encode() + b"\n"); time.sleep(.6); out += t.read_very_eager().decode(errors="ignore")
+        finally: t.close()
+    else:
+        c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy()); a["_job"]["clients"].append(c)
+        try:
+            c.connect(host, port=port, username=u, password=pw, timeout=15, look_for_keys=False, allow_agent=False)
+            sh = c.invoke_shell()
+            def rd(w):
+                time.sleep(w); b = ""
+                while sh.recv_ready(): b += sh.recv(65535).decode(errors="ignore"); time.sleep(.1)
+                return b
+            out += rd(1.5)
+            if en: sh.send("enable\n"); rd(.5); sh.send(en + "\n"); out += rd(.8)
+            for x in ["terminal length 0"] + cmds: sh.send(x + "\n"); out += rd(.7)
+        finally: c.close()
+    out = out.strip()
+    if re.search(r"^\s*% ?(Invalid|Incomplete|Ambiguous|Authorization failed|Login invalid|Bad passwords|Access denied)", out, re.M | re.I):
+        out += "\nERROR: the device rejected some commands or the login (see output above)"
+    return out
 
+def probe(h):
+    # WinRM first: a Windows host may also run OpenSSH, and a Linux host may run Samba
+    for port, o in ((5985, "windows"), (22, "linux"), (445, "windows"), (3389, "windows")):
+        try: socket.create_connection((h, port), 3).close(); return o
+        except OSError: pass
+    raise Exception("Host unreachable (no SSH / WinRM / SMB / RDP port open)")
 
-@app.post("/api/vault/lock")
-def vault_lock():
-    _vk["f"] = None
-    return {"ok": True}
+# ---------- jobs ----------
+def log(client, o, h, task, r):
+    st = "fail" if FAIL.search(r) else "ok"
+    with dbc() as d, d: d.execute("insert into h values(?,?,?,?,?,?,?)", (time.strftime("%Y-%m-%d %H:%M:%S"), client, o, h, task, st, r))
 
+def bad_req(m): return jsonify(error=m), 400
 
-@app.post("/api/vault")
-def vault_save(body: dict = Body(...)):
-    v = _vload()
-    name = (body.get("name") or "").strip()
-    if not _vk["f"] or not v:
-        raise HTTPException(403, "vault is locked")
-    if not name:
-        raise HTTPException(400, "name required")
-    data = {k: body.get(k, "") for k in ("username", "password", "enable", "key", "sudo_pass")}
-    v["items"][name] = _vk["f"].encrypt(json.dumps(data).encode()).decode()
-    _jsave(VAULT, v)
-    return {"ok": True}
+@app.post("/api/run")
+def api_run():
+    a = request.get_json(silent=True) or {}; act = a.get("action", "")
+    try: ts = parse_targets(a.get("targets", ""), a.get("user", ""), a.get("pass", ""), a.get("os", "windows"), a.get("profiles", ""))
+    except Exception as e: return bad_req(str(e))
+    if not ts: return bad_req("Enter at least one target (IP / hostname / CIDR)")
+    for k in ("file", "file2"):
+        n = a[k] = os.path.basename(a.get(k) or "")
+        if n and not (visible(n) and os.path.isfile(os.path.join(DATA, n))): return bad_req(f"File not found in the library: {n}")
+    if act in ("install_uf", "sysmon", "push_conf", "deploy_app", "audit_rules") and not a["file"]: return bad_req("Select a file for this task (upload it to the Files library first)")
+    if act == "install_uf" and len(a.get("apass") or "") < 8: return bad_req("UF admin password must be at least 8 characters (Options)")
+    if act == "svc" and a.get("op") not in OPS: return bad_req("Invalid service action")
+    for k in ("idx", "syslog"):
+        a[k] = (a.get(k) or "").strip()
+        if not re.fullmatch(r"[\w.:\-\[\]]*", a[k]): return bad_req(f"Invalid address: {a[k]}")
+    if not a.get("base"): a["base"] = request.host_url
+    with LOCK:  # forget finished jobs older than 6 hours
+        for k in [k for k, j in JOBS.items() if time.time() - j["t"] > 21600]: JOBS.pop(k, None)
+        jid = uuid.uuid4().hex; job = JOBS[jid] = {"results": {}, "hosts": [t[0] for t in ts], "total": len(ts), "clients": [], "cancel": False, "t": time.time()}
+    task = act + (":" + a.get("svc", "") + "/" + a["op"] if act == "svc" else ""); client = request.remote_addr
+    def one(t):
+        h, u, w, o = t
+        if job["cancel"]: return
+        try:
+            if o == "auto": o = probe(h)
+            if not u: raise Exception("No username (set default credentials, a profile or host,user,pass)")
+            r = {"windows": win, "linux": lin, "cisco": cisco}[o](h, u, w, {**a, "_job": job})
+        except Exception as e: r = "ERROR: " + (str(e) or type(e).__name__)[:500]
+        if not job["cancel"]: job["results"][h] = r; log(client, o, h, task, r)
+    for t in ts: POOL.submit(one, t)
+    return jsonify(id=jid, total=len(ts))
 
+@app.post("/api/cancel/<jid>")
+def api_cancel(jid):
+    j = JOBS.get(jid)
+    if j:
+        j["cancel"] = True
+        for c in j["clients"]:
+            try: c.close()
+            except Exception: pass
+        for h in j["hosts"]: j["results"].setdefault(h, "CANCELLED")
+    return jsonify(ok=True)
 
-@app.delete("/api/vault/{name}")
-def vault_delete(name: str):
-    v = _vload()
-    if not _vk["f"] or not v:
-        raise HTTPException(403, "vault is locked")
-    v["items"].pop(name, None)
-    _jsave(VAULT, v)
-    return {"ok": True}
+@app.get("/api/job/<jid>")
+def api_job(jid):
+    j = JOBS.get(jid, {}); return jsonify({k: v for k, v in j.items() if k != "clients"})
+@app.post("/api/upload")
+def api_upload():
+    for f in request.files.getlist("f"):
+        n = os.path.basename((f.filename or "").replace("\\", "/"))
+        if n and visible(n): f.save(os.path.join(DATA, n))
+    return api_files()
+def host_match(spec):
+    nets, names = [], []
+    for x in [x.strip() for x in re.split(r"[,\n;]+", spec) if x.strip()]:
+        try:
+            if "/" in x: nets.append(ipaddress.ip_network(x, strict=False)); continue
+            if "-" in x and x.count(".") >= 6:
+                nets.append(tuple(sorted(int(ipaddress.ip_address(y.strip())) for y in x.split("-", 1)))); continue
+        except ValueError: pass
+        names.append(x.lower())
+    def m(h):
+        if any(fnmatch.fnmatch(h.lower(), n) for n in names): return True
+        try: ip = ipaddress.ip_address(h)
+        except ValueError: return False
+        return any((ip in n) if hasattr(n, "network_address") else n[0] <= int(ip) <= n[1] for n in nets)
+    return m
 
-
-# ───────────────────────── Cisco syslog templates ─────────────────────────
-@app.get("/api/templates")
-def tpl_list():
-    return _jload(TPL, {})
-
-
-@app.post("/api/templates")
-def tpl_save(body: dict = Body(...)):
-    t = _jload(TPL, {})
-    if not (body.get("name") or "").strip():
-        raise HTTPException(400, "name required")
-    t[body["name"].strip()] = body.get("params", {})
-    _jsave(TPL, t)
-    return {"ok": True}
-
-
-@app.delete("/api/templates/{name}")
-def tpl_delete(name: str):
-    t = _jload(TPL, {})
-    t.pop(name, None)
-    _jsave(TPL, t)
-    return {"ok": True}
-
-
-def _hist(df, dt, os, service, status, q_):
-    return query_history(df, dt, os, service, status, q_)
-
-
+def hist(args):
+    w, p = ["1=1"], []
+    for k, col in (("os", "os"), ("status", "status")):
+        if args.get(k): w.append(f"{col}=?"); p.append(args[k])
+    if args.get("task"): w.append("task like ?"); p.append(args["task"] + "%")
+    if args.get("q"): w.append("(host like ? or output like ?)"); p += [f"%{args['q']}%"] * 2
+    if args.get("frm"): w.append("ts>=?"); p.append(args["frm"])
+    if args.get("to"): w.append("ts<=?"); p.append(args["to"] + " 23:59:59")
+    with dbc() as d: rows = d.execute(f"select ts,client,os,host,task,status,output from h where {' and '.join(w)} order by ts desc limit 5000", p).fetchall()
+    spec = args.get("hosts", "") + "\n" + jload(GRP).get(args.get("group", ""), "")
+    if spec.strip():
+        m = host_match(spec); rows = [r for r in rows if m(r[3])]
+    return rows
 @app.get("/api/history")
-def history(df: str = "", dt: str = "", os: str = "", service: str = "", status: str = "", q: str = ""):
-    return [dict(zip(("ts", "ip", "os", "service", "operation", "ok", "message", "operator"), r))
-            for r in _hist(df, dt, os, service, status, q)]
-
-
+def api_hist(): return jsonify(hist(request.args))
 @app.get("/api/history.csv")
-def history_csv(df: str = "", dt: str = "", os: str = "", service: str = "", status: str = "", q: str = ""):
-    b = io.StringIO()
-    w = csv.writer(b)
-    w.writerow(["time", "target", "os", "service", "operation", "status", "operator", "message"])
-    for r in _hist(df, dt, os, service, status, q):
-        w.writerow([*r[:5], "success" if r[5] else "failed", r[7] or "", r[6]])
-    return Response("\ufeff" + b.getvalue(), media_type="text/csv",
-                    headers={"Content-Disposition": "attachment; filename=history.csv"})
+def api_csv():
+    b = io.StringIO(); w = csv.writer(b); w.writerow(["time", "client", "os", "host", "task", "status", "output"]); w.writerows(hist(request.args))
+    return b.getvalue().encode("utf-8-sig"), 200, {"Content-Type": "text/csv", "Content-Disposition": "attachment; filename=uf-deployer-history.csv"}
+@app.get("/report")
+def report():
+    rows = hist(request.args); ok = sum(r[5] == "ok" for r in rows); E = html.escape
+    tr = "".join(f"<tr class={r[5]}><td>{E(r[0])}</td><td>{E(r[2])}</td><td>{E(r[3])}</td><td>{E(r[4])}</td><td>{E(r[5])}</td></tr><tr><td colspan=5><pre>{E(r[6])}</pre></td></tr>" for r in rows)
+    return (f"<meta charset=utf-8><title>UF Deployer report</title><style>body{{font:12px Segoe UI,sans-serif;margin:24px}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:4px 6px;text-align:left}}"
+            f".fail td:nth-child(5){{color:#c00;font-weight:bold}}.ok td:nth-child(5){{color:#080}}pre{{white-space:pre-wrap;margin:0;font-size:11px}}@media print{{button{{display:none}}}}</style>"
+            f"<h2>Splunk UF Deployer - Report</h2><p>Generated {time.strftime('%Y-%m-%d %H:%M')} - {len(rows)} records, {ok} ok, {len(rows)-ok} failed "
+            f"<button onclick=print()>Print / Save as PDF</button></p><table><tr><th>Time</th><th>OS</th><th>Host</th><th>Task</th><th>Status</th></tr>{tr}</table>")
 
+def facts(rows):
+    H = {}
+    def st_of(t):
+        if re.search(r"not installed", t, re.I): return "Not installed"
+        if re.search(r"not running|stopped|inactive|failed", t, re.I): return "Stopped"
+        if re.search(r"running|active", t, re.I): return "Running"
+        return "Installed"
+    for ts, cl, o, host, task, st, out in reversed(rows):
+        d = H.setdefault(host, dict(os=o, uf="-", sysmon="-", auditd="-", rules=None, apps=0, confs=0, tasks={}, err={}, last=ts))
+        d["tasks"][task] = st; d["last"] = ts; d["os"] = o
+        if st == "fail":
+            d["err"][task] = "auth" if re.search(r"auth|credential|denied|logon|password", out, re.I) else "net" if re.search(r"refused|timed out|unreachable|Max retries|Connection|SMB connect", out, re.I) else "other"; continue
+        d["err"].pop(task, None); low = out.lower()
+        if task == "check":
+            for key, pat in (("uf", r"Splunk UF: (.*)"), ("sysmon", r"Sysmon: (.*)"), ("auditd", r"auditd: (.*)")):
+                m = re.search(pat, out)
+                if m: d[key] = st_of(m[1])
+            m = re.search(r"Service: (.*)", out)
+            if m and d["uf"] != "Not installed": d["uf"] = st_of(m[1])
+        elif task.startswith("svc:"):
+            k = {"splunk": "uf", "sysmon": "sysmon", "auditd": "auditd"}.get(task.split(":")[1].split("/")[0])
+            v = st_of(out)
+            if k and (v != "Installed" or d[k] == "-"): d[k] = v
+        elif task == "install_uf" and re.search(r"exit code: (0|3010)|already installed|running|started", low): d["uf"] = "Running" if "running" in low or "exit code: 0" in low else "Installed"
+        elif task == "sysmon" and ("installed" in low or "updated" in low): d["sysmon"] = "Installed"
+        elif task == "auditd" and "no supported package" not in low: d["auditd"] = "Installed"
+        elif task == "audit_rules":
+            m = re.search(r"rules_total=(\d+) applied=(\d+) removed=(\d+)", out)
+            if m: d["rules"] = tuple(map(int, m.groups()))
+        elif task == "push_conf": d["confs"] += 1
+        elif task == "deploy_app": d["apps"] += 1
+    return H
 
-@app.get("/api/history.pdf")
-def history_pdf(df: str = "", dt: str = "", os: str = "", service: str = "", status: str = "", q: str = ""):
-    from reportlab.lib import colors
-    from reportlab.lib.pagesizes import A4, landscape
-    from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
-    rows = _hist(df, dt, os, service, status, q)
-    st = getSampleStyleSheet()
-    small = st["BodyText"].clone("s", fontSize=7, leading=9)
-    summ = {}
-    for r in rows:
-        k = (r[2], r[3]); s = summ.setdefault(k, [0, 0]); s[0 if r[5] else 1] += 1
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=24, rightMargin=24, topMargin=24, bottomMargin=24)
-    ts = lambda: TableStyle([("GRID", (0, 0), (-1, -1), .4, colors.grey),
-                             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f3a4d")),
-                             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("FONTSIZE", (0, 0), (-1, -1), 7),
-                             ("VALIGN", (0, 0), (-1, -1), "TOP")])
-    t1 = Table([["OS", "Service", "Success", "Failed"]] + [[k[0], k[1], v[0], v[1]] for k, v in sorted(summ.items())])
-    t1.setStyle(ts())
-    t2 = Table([["Time", "Target", "OS", "Service", "Operation", "Status", "User", "Message"]] +
-               [[r[0], r[1], r[2], r[3], r[4], "OK" if r[5] else "FAIL", r[7] or "",
-                 Paragraph((r[6] or "")[:300].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"), small)] for r in rows],
-              colWidths=[80, 80, 45, 55, 100, 40, 55, 320], repeatRows=1)
-    t2.setStyle(ts())
-    doc.build([Paragraph("Deployment report", st["Title"]),
-               Paragraph(time.strftime("Generated %Y-%m-%d %H:%M:%S") + f" - {len(rows)} records", st["BodyText"]),
-               Spacer(1, 8), Paragraph("Summary", st["Heading2"]), t1, Spacer(1, 12),
-               Paragraph("Details", st["Heading2"]), t2])
-    return Response(buf.getvalue(), media_type="application/pdf",
-                    headers={"Content-Disposition": "attachment; filename=report.pdf"})
+def g2j(gy, gm, gd):
+    gdm = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]; gy2 = gy + 1 if gm > 2 else gy
+    days = 355666 + 365 * gy + (gy2 + 3) // 4 - (gy2 + 99) // 100 + (gy2 + 399) // 400 + gd + gdm[gm - 1]
+    jy = -1595 + 33 * (days // 12053); days %= 12053; jy += 4 * (days // 1461); days %= 1461
+    if days > 365: jy += (days - 1) // 365; days = (days - 1) % 365
+    jm, jd = (1 + days // 31, 1 + days % 31) if days < 186 else (7 + (days - 186) // 30, 1 + (days - 186) % 30)
+    return jy, jm, jd
+def fdate(ts, lang):
+    if lang != "fa": return ts
+    jy, jm, jd = g2j(int(ts[:4]), int(ts[5:7]), int(ts[8:10])); return f"{jy}/{jm:02d}/{jd:02d} {ts[11:16]}"
 
+LBL = {"fa": dict(title="گزارش مدیریتی استقرار Splunk", gen="تاریخ گزارش", prn="چاپ / ذخیره PDF", by="تهیه‌کننده",
+        sum="{nh} سرور پردازش شد. {hy} سرور ({p}٪) کاملاً سالم هستند و {bad} سرور نیاز به بررسی دارند. Splunk Forwarder روی {uf} سرور، Sysmon روی {sm} سرور و auditd روی {ad} سرور فعال است. {ra} قانون از {rt} قانون auditd با موفقیت اعمال شد.",
+        k1="سرور", k2="کار انجام‌شده", k3="درصد موفقیت", k4="قانون auditd اعمال‌شده", c1="وضعیت اجرای کارها", c2="پوشش در سرورها", c3="قوانین auditd", c4="وضعیت هر سرور", c5="مشکلات باز",
+        uf="Splunk Forwarder فعال", sm="Sysmon فعال", ad="auditd فعال", hos="سرورهای سالم", okf="{ok} موفق، {bad} ناموفق",
+        lg="اعمال‌شده {ra} ■ حذف‌شده (روی سرور معتبر نبود) {rr} ■ مجموع {rt}", th=["سرور", "سیستم‌عامل", "Splunk UF", "Sysmon", "auditd", "قوانین auditd", "نصب‌شده‌ها", "وضعیت کلی", "آخرین فعالیت"],
+        dep="{a} اپ، {c} کانفیگ", skip="{n} ردشده", tk="{n} کار", none="مشکل بازی وجود ندارد.",
+        st={"Running": "در حال اجرا", "Installed": "نصب شده", "Stopped": "متوقف", "Not installed": "نصب نشده", "Healthy": "سالم", "Attention": "نیاز به بررسی", "Failed": "ناموفق", "-": "—"},
+        os={"windows": "ویندوز", "linux": "لینوکس", "cisco": "سیسکو"},
+        msg={"auth": "ورود پذیرفته نشد؛ نام کاربری و رمز عبور را بررسی کنید", "net": "در دسترس نبود؛ مدیریت از راه دور مسدود یا سرور خاموش است", "other": "یک کار کامل نشد"}),
+       "en": dict(title="Splunk Deployment - Management Report", gen="Generated", prn="Print / Save as PDF", by="Prepared by",
+        sum="{nh} server(s) were processed. {hy} ({p}%) are fully healthy; {bad} need attention. Splunk Forwarder is active on {uf}, Sysmon on {sm} and auditd on {ad} servers. {ra} of {rt} audit rules were applied successfully.",
+        k1="Servers", k2="Tasks executed", k3="Success rate", k4="Audit rules applied", c1="Task outcome", c2="Coverage across servers", c3="Audit rules", c4="Per-server status", c5="Open issues",
+        uf="Splunk Forwarder active", sm="Sysmon active", ad="auditd active", hos="Healthy servers", okf="{ok} succeeded - {bad} failed",
+        lg="applied {ra} ■ removed (not valid on host) {rr} ■ total {rt}", th=["Server", "OS", "Splunk UF", "Sysmon", "auditd", "Audit rules", "Deployed", "Overall", "Last activity"],
+        dep="{a} apps, {c} configs", skip="{n} skipped", tk="{n} task(s)", none="No open issues.",
+        st={}, os={}, msg={"auth": "login was rejected - check the username and password", "net": "could not be reached - remote management is blocked or the host is offline", "other": "a task did not complete"})}
 
-def _find_index():
-    for p in (os.path.join(BASE, "static", "index.html"), os.path.join(BASE, "index.html")):
-        if os.path.isfile(p):
-            return p
-    raise SystemExit("index.html not found: put it next to app.py or inside a 'static' folder")
+@app.get("/report/exec")
+def report_exec():
+    lang = "en" if request.args.get("lang") == "en" else "fa"; L = LBL[lang]; E = html.escape
+    br = jload(BRAND)
+    rows = hist(request.args); H = facts(rows); n = len(rows); ok = sum(r[5] == "ok" for r in rows)
+    tr = lambda v: L["st"].get(v, v)
+    badge = lambda v: f"<span class='bd {'g' if v in ('Running','Installed','Healthy') else 'r' if v in ('Failed','Stopped','Not installed') else 'a' if v=='Attention' else 'n'}'>{tr(v)}</span>"
+    status = {}
+    for h, d in H.items():
+        okc = sum(1 for v in d["tasks"].values() if v == "ok"); status[h] = "Failed" if d["err"] and not okc else "Attention" if d["err"] else "Healthy"
+    cnt = lambda k: sum(d[k] in ("Running", "Installed") for d in H.values())
+    nh = len(H); hy = sum(v == "Healthy" for v in status.values())
+    R = [d["rules"] for d in H.values() if d["rules"]]; rt, ra, rr = (sum(x[i] for x in R) for i in (0, 1, 2))
+    bar = lambda l, v, t, c: f"<div class=b><span>{l}</span><div class=t><i style='width:{(100*v/t if t else 0):.0f}%;background:{c}'></i></div><b>{v}/{t}</b></div>"
+    pct = (100 * ok / n) if n else 0; circ = 251.3
+    donut = (f"<svg width=130 height=130 viewBox='0 0 100 100'><circle cx=50 cy=50 r=40 fill=none stroke='#fca5a5' stroke-width=14 />"
+             f"<circle cx=50 cy=50 r=40 fill=none stroke='#16a34a' stroke-width=14 stroke-dasharray='{circ*pct/100:.1f} {circ}' transform='rotate(-90 50 50)' />"
+             f"<text x=50 y=55 text-anchor=middle font-size=16 font-weight=700>{pct:.0f}%</text></svg>")
+    byos = "".join(bar(f"{L['hos']} ({L['os'].get(o, o.title())})", sum(1 for h, d in H.items() if d["os"] == o and status[h] == "Healthy"), sum(1 for d in H.values() if d["os"] == o), "#2f6bff") for o in sorted({d["os"] for d in H.values()}))
+    stack = (f"<div class=t style='height:22px;display:flex'><i style='width:{(100*ra/rt if rt else 0):.0f}%;background:#16a34a'></i><i style='width:{(100*rr/rt if rt else 0):.0f}%;background:#f59e0b'></i></div>"
+             f"<div class=hint>{L['lg'].format(ra=ra, rr=rr, rt=rt)}</div>")
+    ip = lambda h: f"<bdi class=ip dir=ltr>{E(h)}</bdi>"
+    issues = "".join(f"<li>{ip(h)}: {L['msg'][sorted(d['err'].values())[0]]} ({L['tk'].format(n=len(d['err']))})</li>" for h, d in H.items() if d["err"]) or f"<li>{L['none']}</li>"
+    trs = "".join(f"<tr><td><b>{ip(h)}</b></td><td>{L['os'].get(d['os'], d['os'].title())}</td><td>{badge(d['uf'])}</td><td>{badge(d['sysmon'])}</td><td>{badge(d['auditd'])}</td>"
+                  f"<td>{(str(d['rules'][1]) + ' / ' + str(d['rules'][0]) + (' (' + L['skip'].format(n=d['rules'][2]) + ')' if d['rules'][2] else '')) if d['rules'] else '—'}</td>"
+                  f"<td>{L['dep'].format(a=d['apps'], c=d['confs'])}</td><td>{badge(status[h])}</td><td>{fdate(d['last'], lang)}</td></tr>" for h, d in sorted(H.items()))
+    css = ("body{font:14px Vazirmatn,Tahoma,'Segoe UI',system-ui,sans-serif;margin:0;background:#f4f6fa;color:#1c2434}.w{max-width:1100px;margin:auto;padding:24px}h1{margin:0;font-size:24px}.sub{color:#6a7590;margin-top:2px}"
+           ".hd{display:flex;align-items:center;gap:16px;margin-bottom:16px}.hd img{max-height:70px;max-width:180px}.k{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:14px}"
+           ".c{background:#fff;border:1px solid #dfe4ee;border-radius:10px;padding:14px;margin-bottom:14px}.k .c{margin:0;text-align:center}.k b{display:block;font-size:30px;color:#2f6bff}"
+           ".g2{display:grid;grid-template-columns:1fr 2fr;gap:14px}h3{margin:0 0 10px;font-size:14px;color:#6a7590}.b{display:flex;align-items:center;gap:8px;margin:7px 0}.b span{width:210px}.b b{width:60px;text-align:end}"
+           ".t{flex:1;background:#e5e9f2;border-radius:6px;overflow:hidden;height:14px}.t i{display:block;height:100%}table{border-collapse:collapse;width:100%}td,th{padding:8px;border-bottom:1px solid #e5e9f2;text-align:start}"
+           "th{color:#6a7590;font-size:12px}.bd{padding:2px 10px;border-radius:10px;font-size:12px;font-weight:600;color:#fff;background:#94a3b8;white-space:nowrap}.bd.g{background:#16a34a}.bd.r{background:#dc2626}.bd.a{background:#d97706}"
+           ".hint{color:#6a7590;font-size:12px;margin-top:6px}@media(max-width:700px){.k,.g2{grid-template-columns:1fr 1fr}.g2{grid-template-columns:1fr}.c{overflow-x:auto}}"
+           "@media print{button{display:none}body{background:#fff}.c{break-inside:avoid}}")
+    logo = f"<img src='/logo?v={E(br['logo'])}' alt=logo>" if br.get("logo") else ""
+    sub = " | ".join(x for x in (E(br.get("company", "")), f"{L['by']}: {E(br['by'])}" if br.get("by") else "", f"{L['gen']}: {fdate(time.strftime('%Y-%m-%d %H:%M'), lang)}") if x)
+    digits = ("<script>const D='۰۱۲۳۴۵۶۷۸۹',w=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let x;while(x=w.nextNode())if(!x.parentElement.closest('.ip,script,style'))x.nodeValue=x.nodeValue.replace(/[0-9]/g,d=>D[d])</script>" if lang == "fa" else "")
+    return (f"<!doctype html><html dir={'rtl' if lang == 'fa' else 'ltr'} lang={lang}><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>{E(br.get('title') or L['title'])}</title><style>{css}</style><div class=w>"
+            f"<div class=hd>{logo}<div><h1>{E(br.get('title') or L['title'])}</h1><div class=sub>{sub}</div></div><button style='margin-inline-start:auto;padding:8px 16px' onclick=print()>{L['prn']}</button></div>"
+            f"<div class=c>{L['sum'].format(nh=nh, hy=hy, p=round(100*hy/nh) if nh else 0, bad=nh-hy, uf=cnt('uf'), sm=cnt('sysmon'), ad=cnt('auditd'), ra=ra, rt=rt)}</div>"
+            f"<div class=k><div class=c><b>{nh}</b>{L['k1']}</div><div class=c><b>{n}</b>{L['k2']}</div><div class=c><b>{pct:.0f}%</b>{L['k3']}</div><div class=c><b>{ra}</b>{L['k4']}</div></div>"
+            f"<div class=g2><div class=c><h3>{L['c1']}</h3><div style='text-align:center'>{donut}</div><div class=hint style='text-align:center'>{L['okf'].format(ok=ok, bad=n-ok)}</div></div>"
+            f"<div class=c><h3>{L['c2']}</h3>{bar(L['uf'], cnt('uf'), nh, '#16a34a')}{bar(L['sm'], cnt('sysmon'), nh, '#2f6bff')}{bar(L['ad'], cnt('auditd'), nh, '#7c3aed')}{byos}"
+            f"<h3 style='margin-top:14px'>{L['c3']}</h3>{stack}</div></div>"
+            f"<div class=c><h3>{L['c4']}</h3><table><tr>{''.join('<th>' + x + '</th>' for x in L['th'])}</tr>{trs}</table></div>"
+            f"<div class=c><h3>{L['c5']}</h3><ul>{issues}</ul></div></div>{digits}")
 
-
-with open(_find_index(), encoding="utf-8") as _f:
-    INDEX_HTML = _f.read().replace("</head>", f'<meta name="ufd-token" content="{TOKEN}">\n</head>', 1)
-
-
+@app.get("/api/branding")
+def api_brand_get(): return jsonify(jload(BRAND))
+@app.post("/api/branding")
+def api_brand_set():
+    with LOCK:
+        b = jload(BRAND); b.update({k: str(v) for k, v in (request.get_json(silent=True) or {}).items() if k in ("company", "title", "by", "logo")})
+        return jsonify(jsave(BRAND, b))
+@app.post("/api/logo")
+def api_logo():
+    f = request.files.get("f")
+    ext = os.path.splitext(f.filename or "")[1].lower() if f else ""
+    if ext not in (".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp"): return bad_req("Use png/jpg/svg/gif/webp")
+    with LOCK:
+        for o in os.listdir(DATA):
+            if o.startswith("logo."): os.remove(os.path.join(DATA, o))
+        f.save(os.path.join(DATA, "logo" + ext)); b = jload(BRAND)
+        b["logo"] = str(int(time.time())) + ext; return jsonify(jsave(BRAND, b))
+@app.get("/logo")
+def logo():
+    for o in os.listdir(DATA):
+        if o.startswith("logo."): return send_from_directory(DATA, o)
+    return "", 404
+def named_store(path):
+    d = request.get_json(silent=True) or {}; name = str(d.get("name", "")).strip()
+    with LOCK:
+        g = jload(path)
+        if name:
+            if str(d.get("text", "")).strip(): g[name] = d["text"]
+            else: g.pop(name, None)
+            jsave(path, g)
+    return jsonify(g)
+@app.get("/api/groups")
+def api_grp_get(): return jsonify(jload(GRP))
+@app.post("/api/groups")
+def api_grp_set(): return named_store(GRP)
+@app.get("/api/templates")
+def api_tpl_get(): return jsonify(jload(TPL))
+@app.post("/api/templates")
+def api_tpl_set(): return named_store(TPL)
+@app.get("/api/filelist")
+def api_filelist(): return jsonify([[n, os.path.getsize(os.path.join(DATA, n))] for n in sorted(os.listdir(DATA)) if visible(n) and os.path.isfile(os.path.join(DATA, n))])
+@app.post("/api/delete")
+def api_delete():
+    n = os.path.basename(str((request.get_json(silent=True) or {}).get("name", ""))); p = os.path.join(DATA, n)
+    if n and visible(n) and os.path.isfile(p): os.remove(p)
+    return api_filelist()
+@app.get("/api/files")
+def api_files(): return jsonify(sorted(n for n in os.listdir(DATA) if visible(n) and os.path.isfile(os.path.join(DATA, n))))
+@app.get("/files/<path:n>")
+def files(n):  # targets download from here: never expose history / groups / branding
+    if n != os.path.basename(n) or not visible(n): abort(404)
+    return send_from_directory(DATA, n)
 @app.get("/")
 def index():
-    r = HTMLResponse(INDEX_HTML, headers={"Cache-Control": "no-store"})
-    r.set_cookie("ufd", TOKEN, httponly=True, samesite="strict")
-    return r
+    with open(os.path.join(HERE, "index.html"), encoding="utf-8") as fh: return fh.read()
 
 if __name__ == "__main__":
-    import sys, threading as _t, uvicorn, webbrowser
-    if "--no-browser" not in sys.argv:
-        _t.Timer(1.2, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
-    uvicorn.run(app, host="127.0.0.1", port=PORT)
+    args = sys.argv[1:]; port = next((int(x) for x in args if x.isdigit()), int(os.environ.get("PORT", 5000)))
+    if "--no-browser" not in args: threading.Timer(1.5, webbrowser.open, [f"http://127.0.0.1:{port}"]).start()
+    app.run(host="0.0.0.0", port=port, threaded=True)

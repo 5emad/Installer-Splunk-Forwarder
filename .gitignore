@@ -17,3 +17,7 @@ venv/
 build/
 dist/
 *.spec
+
+# library files, groups, branding and history live in data/ (internal IPs, Sysmon.exe, rule files) - never commit
+data/
+.claude/
